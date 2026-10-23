@@ -918,10 +918,6 @@ static void RAACHEATOpenPanel(void) {
 
 @end
 
-static NSArray<NSString *> *RXAAFeatureTitles(void) {
-    return @[@"AimLock", @"ESP", @"Radar"];
-}
-
 static NSArray<NSString *> *RXAAFeatureKeys(void) {
     return @[@"rxaa.aimlock", @"rxaa.esp", @"rxaa.radar"];
 }
