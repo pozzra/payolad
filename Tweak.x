@@ -1417,6 +1417,7 @@ static NSArray<NSString *> *RXAAFeatureKeys(void) {
     BOOL rosDylibLoaded = NSClassFromString(@"DLGMem") != nil || NSClassFromString(@"DLGMemUIView") != nil;
     BOOL sclLoaded = NSClassFromString(@"SCLAlertView") != nil;
 
+    BOOL isActive = ([UIApplication sharedApplication].applicationState == UIApplicationStateActive);
     NSString *message = [NSString stringWithFormat:
         @"Game Status & Diagnostics\n\n"
         @"Bundle ID: %@\n"
@@ -1430,7 +1431,7 @@ static NSArray<NSString *> *RXAAFeatureKeys(void) {
         @"SCLAlertView loaded: %@\n\n"
         @"Note: Rxaa is UI-only. Switches write NSUserDefaults locally and do not hook the game process. If ros.dylib is loaded, it provides its own memory-scanner menu independently.",
         bundleID,
-        @([[UIApplication sharedApplication].applicationState == UIApplicationStateActive]),
+        isActive ? @"YES" : @"NO",
         (unsigned long)sceneCount,
         (unsigned long)windowCount,
         (unsigned long)nonRxaaWindowCount,
