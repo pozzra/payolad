@@ -12,6 +12,9 @@ static UITapGestureRecognizer *gOpenGesture = nil;
 static UIWindow *gGestureWindow = nil;
 static UIWindow *gPreviousKeyWindow = nil;
 static int gInstallAttempts = 0;
+static BOOL gInstallRetryScheduled = NO;
+static BOOL gUsingLegacyWindows = NO;
+static BOOL gMenuDismissing = NO;
 
 static CGFloat const kRXAAFloatButtonSize = 52.0;
 static CGFloat const kRXAAFloatButtonMargin = 10.0;
@@ -21,6 +24,11 @@ static CGPoint gButtonPanStartCenter;
 static CGPoint gButtonPanStartPoint;
 
 static void RAACHEATAttachWindowToScene(void);
+static void RAACHEATTryInstall(void);
+static void RAACHEATEnsureOverlayVisible(void);
+static void RAACHEATScheduleInstallRetry(void);
+static UIWindowScene *RAACHEATActiveWindowScene(void);
+static UIWindow *RAACHEATHostWindow(UIWindowScene *scene);
 
 @interface RAACHEATPassThroughView : UIView
 @end
@@ -57,8 +65,7 @@ static NSString *RAACHEATResourcePath(NSString *name) {
 }
 
 static NSString *RAACHEATCatalogPath(void) {
-    NSString *path = RAACHEATResourcePath(@"index.html");
-    return path ? path : @"/Library/Application Support/RAACHEATMenuDebug/index.html";
+    return RAACHEATResourcePath(@"index.html");
 }
 
 typedef struct {
@@ -204,57 +211,108 @@ static NSArray<NSString *> *RXAACatalogCategories(void) {
     return @[@"aimbot", @"visuals", @"memory", @"settings", @"help"];
 }
 
+static NSArray<NSString *> *RXAACatalogAllCategories(void) {
+    return @[@"aimbot", @"visuals", @"memory", @"settings", @"help",
+             @"ui", @"ui-id", @"runtime", @"path", @"format"];
+}
+
+static NSString *RXAACatalogCategoryDisplayName(NSString *category) {
+    if ([category isEqualToString:@"aimbot"]) {
+        return @"Aimbot & Combat";
+    } else if ([category isEqualToString:@"visuals"]) {
+        return @"Cyber ESP & Visuals";
+    } else if ([category isEqualToString:@"memory"]) {
+        return @"Memory & Movement";
+    } else if ([category isEqualToString:@"settings"]) {
+        return @"Settings & Config";
+    } else if ([category isEqualToString:@"help"]) {
+        return @"Help & Notes";
+    } else if ([category isEqualToString:@"ui"]) {
+        return @"UI Strings";
+    } else if ([category isEqualToString:@"ui-id"]) {
+        return @"UI Identifiers";
+    } else if ([category isEqualToString:@"runtime"]) {
+        return @"Runtime Diagnostics";
+    } else if ([category isEqualToString:@"path"]) {
+        return @"Game Paths";
+    } else if ([category isEqualToString:@"format"]) {
+        return @"Format Strings";
+    }
+    return category ? [category capitalizedString] : @"Catalog";
+}
+
+static NSArray<NSDictionary *> *RXAACatalogLoadItemsInCategories(NSArray<NSString *> *categories) {
+    NSString *path = RAACHEATResourcePath(@"menu_catalog.json");
+    NSData *data = path ? [NSData dataWithContentsOfFile:path] : nil;
+    id root = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    NSArray *items = nil;
+    if ([root isKindOfClass:[NSDictionary class]]) {
+        id value = ((NSDictionary *)root)[@"items"];
+        if ([value isKindOfClass:[NSArray class]]) {
+            items = (NSArray *)value;
+        }
+    }
+
+    NSSet<NSString *> *wanted = [NSSet setWithArray:categories];
+    NSMutableArray<NSDictionary *> *result = [NSMutableArray array];
+    for (id item in items) {
+        if (![item isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        NSDictionary *entry = (NSDictionary *)item;
+        NSString *category = entry[@"category"];
+        NSString *label = entry[@"label"];
+        if (![category isKindOfClass:[NSString class]] ||
+            ![label isKindOfClass:[NSString class]] ||
+            ![wanted containsObject:category]) {
+            continue;
+        }
+        [result addObject:entry];
+    }
+    if (result.count == 0) {
+        NSLog(@"[Rxaa] catalog JSON unavailable at %@; using embedded catalog", path);
+        return RXAAEmbeddedCatalogFeatures();
+    }
+    NSLog(@"[Rxaa] loaded %lu catalog entries from %@",
+          (unsigned long)result.count, path);
+    return [result copy];
+}
+
 static NSArray<NSDictionary *> *RXAACatalogFeatures(void) {
     static NSArray<NSDictionary *> *features = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        NSString *path = RAACHEATResourcePath(@"menu_catalog.json");
-        NSData *data = path ? [NSData dataWithContentsOfFile:path] : nil;
-        id root = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
-        NSArray *items = nil;
-        if ([root isKindOfClass:[NSDictionary class]]) {
-            id value = ((NSDictionary *)root)[@"items"];
-            if ([value isKindOfClass:[NSArray class]]) {
-                items = (NSArray *)value;
-            }
-        }
-
-        NSSet<NSString *> *wanted = [NSSet setWithArray:RXAACatalogCategories()];
-        NSMutableArray<NSDictionary *> *result = [NSMutableArray array];
-        for (id item in items) {
-            if (![item isKindOfClass:[NSDictionary class]]) {
-                continue;
-            }
-            NSDictionary *entry = (NSDictionary *)item;
-            NSString *category = entry[@"category"];
-            NSString *label = entry[@"label"];
-            if (![category isKindOfClass:[NSString class]] ||
-                ![label isKindOfClass:[NSString class]] ||
-                ![wanted containsObject:category]) {
-                continue;
-            }
-            [result addObject:entry];
-        }
-        if (result.count == 0) {
-            NSLog(@"[Rxaa] catalog JSON unavailable at %@; using embedded features", path);
-            result = [RXAAEmbeddedCatalogFeatures() mutableCopy];
-        } else {
-            NSLog(@"[Rxaa] loaded %lu catalog features from %@",
-                  (unsigned long)result.count, path);
-        }
-        features = [result copy];
+        features = RXAACatalogLoadItemsInCategories(RXAACatalogCategories());
     });
     return features ? features : @[];
 }
 
-static NSArray<NSDictionary *> *RXAACatalogFeaturesForCategory(NSString *category) {
+static NSArray<NSDictionary *> *RXAACatalogAllFeatures(void) {
+    static NSArray<NSDictionary *> *features = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        features = RXAACatalogLoadItemsInCategories(RXAACatalogAllCategories());
+    });
+    return features ? features : @[];
+}
+
+static NSArray<NSDictionary *> *RXAACatalogFilterByCategory(NSArray<NSDictionary *> *items,
+                                                            NSString *category) {
     NSMutableArray<NSDictionary *> *result = [NSMutableArray array];
-    for (NSDictionary *item in RXAACatalogFeatures()) {
+    for (NSDictionary *item in items) {
         if ([item[@"category"] isEqualToString:category]) {
             [result addObject:item];
         }
     }
     return result;
+}
+
+static NSArray<NSDictionary *> *RXAACatalogFeaturesForCategory(NSString *category) {
+    return RXAACatalogFilterByCategory(RXAACatalogFeatures(), category);
+}
+
+static NSArray<NSDictionary *> *RXAACatalogAllFeaturesForCategory(NSString *category) {
+    return RXAACatalogFilterByCategory(RXAACatalogAllFeatures(), category);
 }
 
 static NSString *RXAACatalogFeatureKey(NSDictionary *item) {
@@ -277,19 +335,119 @@ static BOOL RXAACatalogFeatureIsActionable(NSDictionary *item) {
            [kind isEqualToString:@"config-key"];
 }
 
-@interface RXAAMenuViewController : UITableViewController
+static NSUInteger RXAACatalogActionableCount(NSArray<NSDictionary *> *items) {
+    NSUInteger count = 0;
+    for (NSDictionary *item in items) {
+        if (RXAACatalogFeatureIsActionable(item)) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static NSArray<NSDictionary *> *RXAASidebarCatalogRows(void) {
+    static NSArray<NSDictionary *> *rows = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSMutableArray<NSDictionary *> *result = [NSMutableArray array];
+        for (NSString *category in RXAACatalogCategories()) {
+            NSUInteger count = [RXAACatalogFeaturesForCategory(category) count];
+            [result addObject:@{
+                @"key": category,
+                @"title": RXAACatalogCategoryDisplayName(category),
+                @"subtitle": [NSString stringWithFormat:@"%lu entries", (unsigned long)count]
+            }];
+        }
+        rows = [result copy];
+    });
+    return rows ? rows : @[];
+}
+
+static NSArray<NSDictionary *> *RXAAMenuToolRows(void) {
+    static NSArray<NSDictionary *> *rows = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSUInteger allCount = [RXAACatalogAllFeatures() count];
+        NSUInteger actionableCount = RXAACatalogActionableCount(RXAACatalogAllFeatures());
+        rows = @[
+            @{@"action": @"apply-all",
+              @"title": @"Apply All (Demo)",
+              @"subtitle": [NSString stringWithFormat:@"Turn %lu catalog switches ON",
+                            (unsigned long)actionableCount]},
+            @{@"action": @"reset-all",
+              @"title": @"Reset All (Demo)",
+              @"subtitle": [NSString stringWithFormat:@"Turn %lu catalog switches OFF",
+                            (unsigned long)actionableCount]},
+            @{@"action": @"get-code",
+              @"title": @"Get Code (Offline Catalog)",
+              @"subtitle": @"Browse addresses, xrefs and ARM64 snippets"},
+            @{@"action": @"all-features",
+              @"title": @"Full Catalog",
+              @"subtitle": [NSString stringWithFormat:@"%lu entries across all categories",
+                            (unsigned long)allCount]},
+            @{@"action": @"python",
+              @"title": @"Python Engine (mod_menu.py)",
+              @"subtitle": @"CLI & config generator in Application Support"},
+            @{@"action": @"telegram",
+              @"title": @"Telegram: @kun_amra",
+              @"subtitle": @"Tap to open the official channel"},
+            @{@"action": @"repair-overlay",
+              @"title": @"Repair / Reattach Overlay",
+              @"subtitle": @"Reattach Rxaa to current game window & scene"},
+            @{@"action": @"game-status",
+              @"title": @"Game Status & Diagnostics",
+              @"subtitle": @"Bundle, scenes, windows, overlay state, ros.dylib"},
+            @{@"action": @"about",
+              @"title": @"About Rxaa",
+              @"subtitle": @"UI-only debug build | no game hooks"}
+        ];
+    });
+    return rows ? rows : @[];
+}
+
+typedef NS_ENUM(NSInteger, RXAAMenuDetailMode) {
+    RXAAMenuDetailModeCatalog = 0,
+    RXAAMenuDetailModeTools = 1
+};
+
+@interface RXAAMenuViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
+@property (nonatomic, strong) UITableView *sidebarTableView;
+@property (nonatomic, strong) UITableView *detailTableView;
+@property (nonatomic, strong) UIView *dividerView;
+@property (nonatomic, copy) NSString *activeCategory;
+@property (nonatomic, assign) RXAAMenuDetailMode detailMode;
+- (void)configureNavigationBar;
+- (void)selectActiveSidebarRow;
+- (void)closeMenu;
+- (UITableViewCell *)sidebarCellForRowAtIndexPath:(NSIndexPath *)indexPath;
+- (UITableViewCell *)detailCellForRowAtIndexPath:(NSIndexPath *)indexPath;
+- (void)catalogSwitchChanged:(UISwitch *)sender;
+- (NSUInteger)setAllDemoSwitches:(BOOL)on;
+- (void)showFeatureDetails:(NSDictionary *)item;
+- (void)showPythonEngineInfo;
+- (void)showAbout;
+- (void)showDemoActionAlert:(BOOL)on count:(NSUInteger)count;
+- (void)showRepairOverlayDiagnostics;
+- (void)showGameStatusDiagnostics;
+- (void)handleToolAction:(NSString *)action;
 @end
 
 @interface RXAACatalogFeatureViewController : UITableViewController
+@property (nonatomic, assign) BOOL showsAllCategories;
+@property (nonatomic, copy) NSArray<NSString *> *visibleCategories;
 - (void)catalogSwitchChanged:(UISwitch *)sender;
+- (NSArray<NSString *> *)catalogCategories;
+- (NSArray<NSDictionary *> *)featuresForCategory:(NSString *)category;
 @end
 
 @interface RXAACatalogSwitch : UISwitch
 @property (nonatomic, copy) NSString *featureKey;
 @end
 
-@interface RXAACatalogViewController : UIViewController
+@interface RXAACatalogViewController : UIViewController <WKNavigationDelegate>
 @property (nonatomic, strong) WKWebView *webView;
+@property (nonatomic, strong) UILabel *errorLabel;
+- (void)showCatalogError:(NSString *)message;
 @end
 
 @interface RAACHEATRootController : UIViewController <UIGestureRecognizerDelegate>
@@ -301,11 +459,15 @@ static BOOL RXAACatalogFeatureIsActionable(NSDictionary *item) {
 - (void)raacheatPan:(UIPanGestureRecognizer *)pan;
 @end
 
+static BOOL RAACHEATIsRxaaWindow(UIWindow *window) {
+    return window != nil && (window == gOverlayWindow || window == gButtonWindow);
+}
+
 static UIWindow *RAACHEATKeyWindowForScene(UIWindowScene *scene) {
     if (@available(iOS 13.0, *)) {
         if (scene) {
             for (UIWindow *window in scene.windows) {
-                if (window.isKeyWindow) {
+                if (window.isKeyWindow && !RAACHEATIsRxaaWindow(window)) {
                     return window;
                 }
             }
@@ -315,14 +477,14 @@ static UIWindow *RAACHEATKeyWindowForScene(UIWindowScene *scene) {
                 continue;
             }
             for (UIWindow *window in ((UIWindowScene *)connected).windows) {
-                if (window.isKeyWindow) {
+                if (window.isKeyWindow && !RAACHEATIsRxaaWindow(window)) {
                     return window;
                 }
             }
         }
     }
     for (UIWindow *window in [UIApplication sharedApplication].windows) {
-        if (window.isKeyWindow) {
+        if (window.isKeyWindow && !RAACHEATIsRxaaWindow(window)) {
             return window;
         }
     }
@@ -437,26 +599,33 @@ static void RAACHEATRestoreFloatButtonPosition(void) {
     gButtonWindow.center = RAACHEATClampFloatButtonCenter(center);
 }
 
-static void RAACHEATRestorePreviousKeyWindow(void) {
-    if (gOverlayWindow) {
-        gOverlayWindow.hidden = YES;
-    }
-    if (gButtonWindow) {
-        gButtonWindow.hidden = NO;
-        gButtonWindow.windowLevel = UIWindowLevelAlert + 101.0;
-        RAACHEATRestoreFloatButtonPosition();
+static void RAACHEATRestoreGameKeyWindow(void) {
+    UIWindow *target = gPreviousKeyWindow;
+    if (!target || RAACHEATIsRxaaWindow(target) || target.hidden) {
+        target = nil;
     }
 
-    UIWindow *target = gPreviousKeyWindow;
-    if (!target || target == gOverlayWindow || target == gButtonWindow || target.hidden) {
+    if (@available(iOS 13.0, *)) {
+        UIWindowScene *overlayScene = gOverlayWindow.windowScene;
+        if (overlayScene && (!target || target.windowScene != overlayScene)) {
+            for (UIWindow *window in overlayScene.windows) {
+                if (!RAACHEATIsRxaaWindow(window) && !window.hidden) {
+                    target = window;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!target) {
         target = RAACHEATKeyWindowForScene(nil);
-        if (target == gOverlayWindow || target == gButtonWindow || target.hidden) {
+        if (RAACHEATIsRxaaWindow(target) || target.hidden) {
             target = nil;
         }
     }
     if (!target) {
         for (UIWindow *window in [UIApplication sharedApplication].windows) {
-            if (window != gOverlayWindow && window != gButtonWindow && !window.hidden) {
+            if (!RAACHEATIsRxaaWindow(window) && !window.hidden) {
                 target = window;
                 break;
             }
@@ -472,6 +641,61 @@ static void RAACHEATRestorePreviousKeyWindow(void) {
     gPreviousKeyWindow = nil;
 }
 
+static void RAACHEATRestorePreviousKeyWindow(void) {
+    if (gOverlayWindow) {
+        gOverlayWindow.hidden = YES;
+    }
+    if (gButtonWindow) {
+        gButtonWindow.hidden = NO;
+        gButtonWindow.windowLevel = UIWindowLevelAlert + 1001.0;
+        RAACHEATRestoreFloatButtonPosition();
+    }
+    RAACHEATRestoreGameKeyWindow();
+}
+
+static void RAACHEATDismissMenuForResignation(void) {
+    UINavigationController *nav = gMenuNav;
+    gMenuNav = nil;
+    gMenuDismissing = YES;
+
+    void (^finish)(void) = ^{
+        gMenuDismissing = NO;
+        RAACHEATRestoreGameKeyWindow();
+        if (gOverlayWindow) {
+            UIViewController *root = gOverlayWindow.rootViewController;
+            if (root.presentedViewController) {
+                [root dismissViewControllerAnimated:NO completion:nil];
+            }
+            gOverlayWindow.hidden = YES;
+        }
+        if (gButtonWindow) {
+            gButtonWindow.hidden = YES;
+        }
+    };
+
+    if (!nav) {
+        gMenuDismissing = NO;
+        if (gOverlayWindow) {
+            gOverlayWindow.hidden = YES;
+        }
+        if (gButtonWindow) {
+            gButtonWindow.hidden = YES;
+        }
+        return;
+    }
+
+    NSLog(@"[Rxaa] app resigned active; closing menu");
+    UIViewController *presenter = nav.presentingViewController;
+    if (!presenter && gOverlayWindow) {
+        presenter = gOverlayWindow.rootViewController;
+    }
+    if (presenter) {
+        [presenter dismissViewControllerAnimated:NO completion:finish];
+    } else {
+        finish();
+    }
+}
+
 static void RAACHEATRefreshOverlayBounds(void) {
     if (!gOverlayWindow) {
         return;
@@ -480,8 +704,17 @@ static void RAACHEATRefreshOverlayBounds(void) {
     CGRect bounds = CGRectZero;
     if (@available(iOS 13.0, *)) {
         UIWindowScene *scene = gOverlayWindow.windowScene;
+        if (!scene) {
+            scene = RAACHEATActiveWindowScene();
+        }
         if (scene) {
             bounds = scene.coordinateSpace.bounds;
+        }
+    }
+    if (CGRectIsEmpty(bounds)) {
+        UIWindow *host = RAACHEATHostWindow(gOverlayWindow.windowScene);
+        if (host) {
+            bounds = host.bounds;
         }
     }
     if (CGRectIsEmpty(bounds)) {
@@ -499,9 +732,26 @@ static void RAACHEATRefreshOverlayBounds(void) {
     }
 }
 
+@interface RXAANavigationController : UINavigationController
+@end
+
+@implementation RXAANavigationController
+- (UIViewController *)childForStatusBarStyle {
+    return self.topViewController;
+}
+- (UIViewController *)childForStatusBarHidden {
+    return self.topViewController;
+}
+@end
+
 static void RAACHEATOpenPanel(void) {
+    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
+        NSLog(@"[Rxaa] open ignored: app is not active");
+        return;
+    }
     if (!gOverlayWindow) {
-        NSLog(@"[Rxaa] open ignored: overlay window is nil");
+        NSLog(@"[Rxaa] open requested before overlay install; retrying install");
+        RAACHEATTryInstall();
         return;
     }
 
@@ -512,7 +762,8 @@ static void RAACHEATOpenPanel(void) {
     }
 
     if (gMenuNav) {
-        if (root.presentedViewController == gMenuNav) {
+        if (root.presentedViewController == gMenuNav ||
+            gMenuNav.presentingViewController == root) {
             NSLog(@"[Rxaa] open ignored: menu already presented");
             return;
         }
@@ -520,25 +771,39 @@ static void RAACHEATOpenPanel(void) {
     }
 
     if (root.presentedViewController) {
-        NSLog(@"[Rxaa] open ignored: another controller is presented: %@", root.presentedViewController);
+        // A menu left presented across a resign/activate cycle used to block every
+        // later open. Dismiss the stale controller first, then retry once.
+        UIViewController *stale = root.presentedViewController;
+        NSLog(@"[Rxaa] dismissing stale presentation before open: %@", stale);
+        gMenuDismissing = YES;
+        [root dismissViewControllerAnimated:NO completion:^{
+            gMenuDismissing = NO;
+            if (gOverlayWindow.rootViewController.presentedViewController == nil) {
+                RAACHEATOpenPanel();
+            } else {
+                NSLog(@"[Rxaa] stale presentation did not dismiss");
+            }
+        }];
         return;
     }
 
     NSLog(@"[Rxaa] opening menu");
+    gMenuDismissing = NO;
     RAACHEATAttachWindowToScene();
     RAACHEATRefreshOverlayBounds();
     gOverlayWindow.hidden = NO;
-    gOverlayWindow.windowLevel = UIWindowLevelAlert + 100.0;
+    gOverlayWindow.windowLevel = UIWindowLevelAlert + 1000.0;
     if (gButtonWindow) {
         gButtonWindow.hidden = YES;
+        gButtonWindow.windowLevel = UIWindowLevelAlert + 1001.0;
     }
     gPreviousKeyWindow = RAACHEATKeyWindowForScene(nil);
-    if (gPreviousKeyWindow == gOverlayWindow || gPreviousKeyWindow == gButtonWindow) {
+    if (RAACHEATIsRxaaWindow(gPreviousKeyWindow)) {
         gPreviousKeyWindow = nil;
     }
     if (!gPreviousKeyWindow) {
         for (UIWindow *window in [UIApplication sharedApplication].windows) {
-            if (window != gOverlayWindow && window != gButtonWindow && !window.hidden) {
+            if (!RAACHEATIsRxaaWindow(window) && !window.hidden) {
                 gPreviousKeyWindow = window;
                 break;
             }
@@ -546,8 +811,8 @@ static void RAACHEATOpenPanel(void) {
     }
     [gOverlayWindow makeKeyAndVisible];
 
-    RXAAMenuViewController *menu = [[RXAAMenuViewController alloc] initWithStyle:UITableViewStyleGrouped];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:menu];
+    RXAAMenuViewController *menu = [[RXAAMenuViewController alloc] init];
+    RXAANavigationController *nav = [[RXAANavigationController alloc] initWithRootViewController:menu];
     nav.modalPresentationStyle = UIModalPresentationFullScreen;
     nav.modalTransitionStyle = UIModalTransitionStyleCoverVertical;
     nav.modalPresentationCapturesStatusBarAppearance = YES;
@@ -667,17 +932,51 @@ static NSArray<NSString *> *RXAAFeatureKeys(void) {
     [super viewDidLoad];
 
     self.title = @"Rxaa";
+    self.view.backgroundColor = RXAABackground();
+    self.edgesForExtendedLayout = UIRectEdgeNone;
+    self.extendedLayoutIncludesOpaqueBars = NO;
+
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc]
         initWithTitle:@"Close"
                 style:UIBarButtonItemStyleDone
                 target:self
                 action:@selector(closeMenu)];
 
-    self.tableView.backgroundColor = RXAABackground();
-    self.tableView.separatorColor = [UIColor colorWithWhite:0.10 alpha:1.0];
-    self.tableView.tableFooterView = [[UIView alloc] init];
-    self.tableView.rowHeight = 58.0;
+    self.sidebarTableView = [[UITableView alloc] initWithFrame:CGRectZero
+                                                          style:UITableViewStylePlain];
+    self.sidebarTableView.dataSource = self;
+    self.sidebarTableView.delegate = self;
+    self.sidebarTableView.backgroundColor = [UIColor colorWithWhite:0.025 alpha:1.0];
+    self.sidebarTableView.separatorColor = [UIColor colorWithWhite:0.10 alpha:1.0];
+    self.sidebarTableView.tableFooterView = [[UIView alloc] init];
+    self.sidebarTableView.rowHeight = 54.0;
+    self.sidebarTableView.contentInset = UIEdgeInsetsMake(0.0, 0.0, 24.0, 0.0);
+    self.sidebarTableView.showsVerticalScrollIndicator = NO;
 
+    self.detailTableView = [[UITableView alloc] initWithFrame:CGRectZero
+                                                         style:UITableViewStylePlain];
+    self.detailTableView.dataSource = self;
+    self.detailTableView.delegate = self;
+    self.detailTableView.backgroundColor = RXAABackground();
+    self.detailTableView.separatorColor = [UIColor colorWithWhite:0.13 alpha:1.0];
+    self.detailTableView.tableFooterView = [[UIView alloc] init];
+    self.detailTableView.rowHeight = 64.0;
+    self.detailTableView.contentInset = UIEdgeInsetsMake(0.0, 0.0, 24.0, 0.0);
+
+    self.dividerView = [[UIView alloc] initWithFrame:CGRectZero];
+    self.dividerView.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1.0];
+
+    [self.view addSubview:self.sidebarTableView];
+    [self.view addSubview:self.dividerView];
+    [self.view addSubview:self.detailTableView];
+
+    self.activeCategory = RXAACatalogCategories().firstObject;
+    self.detailMode = RXAAMenuDetailModeCatalog;
+
+    [self configureNavigationBar];
+}
+
+- (void)configureNavigationBar {
     if (@available(iOS 13.0, *)) {
         UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
         [appearance configureWithOpaqueBackground];
@@ -685,9 +984,67 @@ static NSArray<NSString *> *RXAAFeatureKeys(void) {
         appearance.titleTextAttributes = @{NSForegroundColorAttributeName: RXAAGreen()};
         self.navigationController.navigationBar.standardAppearance = appearance;
         self.navigationController.navigationBar.scrollEdgeAppearance = appearance;
+        self.navigationController.navigationBar.compactAppearance = appearance;
     }
     self.navigationController.navigationBar.barStyle = UIBarStyleBlack;
     self.navigationController.navigationBar.tintColor = RXAAGreen();
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self configureNavigationBar];
+    [self.sidebarTableView reloadData];
+    [self.detailTableView reloadData];
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    [self selectActiveSidebarRow];
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+
+    CGRect bounds = self.view.bounds;
+    CGFloat width = bounds.size.width;
+    CGFloat height = bounds.size.height;
+    UIEdgeInsets safe = UIEdgeInsetsZero;
+    if (@available(iOS 11.0, *)) {
+        safe = self.view.safeAreaInsets;
+    }
+    CGFloat usableWidth = MAX(0.0, width - safe.left - safe.right);
+    CGFloat sidebarWidth = MIN(232.0, MAX(132.0, usableWidth * 0.30));
+    CGFloat dividerWidth = 1.0 / MAX(1.0, [UIScreen mainScreen].scale);
+
+    self.sidebarTableView.frame = CGRectMake(safe.left, 0.0, sidebarWidth, height);
+    self.dividerView.frame = CGRectMake(safe.left + sidebarWidth, 0.0, dividerWidth, height);
+    self.detailTableView.frame = CGRectMake(safe.left + sidebarWidth + dividerWidth, 0.0,
+                                            MAX(0.0, usableWidth - sidebarWidth - dividerWidth),
+                                            height);
+    self.sidebarTableView.contentInset = UIEdgeInsetsMake(0.0, 0.0, safe.bottom + 24.0, 0.0);
+    self.detailTableView.contentInset = UIEdgeInsetsMake(0.0, 0.0, safe.bottom + 24.0, 0.0);
+    self.sidebarTableView.scrollIndicatorInsets = UIEdgeInsetsMake(0.0, 0.0, safe.bottom, 0.0);
+    self.detailTableView.scrollIndicatorInsets = UIEdgeInsetsMake(0.0, 0.0, safe.bottom, 0.0);
+}
+
+- (void)selectActiveSidebarRow {
+    NSIndexPath *indexPath = nil;
+    if (self.detailMode == RXAAMenuDetailModeTools) {
+        indexPath = [NSIndexPath indexPathForRow:0 inSection:2];
+    } else {
+        NSArray<NSDictionary *> *rows = RXAASidebarCatalogRows();
+        NSUInteger row = 0;
+        for (NSUInteger i = 0; i < rows.count; i++) {
+            if ([rows[i][@"key"] isEqualToString:self.activeCategory]) {
+                row = i;
+                break;
+            }
+        }
+        indexPath = [NSIndexPath indexPathForRow:(NSInteger)row inSection:0];
+    }
+    [self.sidebarTableView selectRowAtIndexPath:indexPath
+                                       animated:NO
+                                 scrollPosition:UITableViewScrollPositionNone];
 }
 
 - (void)closeMenu {
@@ -705,136 +1062,478 @@ static NSArray<NSString *> *RXAAFeatureKeys(void) {
     }
 }
 
+#pragma mark - Table data source
+
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
-    return 2;
+    if (tableView == self.sidebarTableView) {
+        return 3;
+    }
+    return 1;
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    if (section == 0) {
-        return (NSInteger)[RXAAFeatureTitles() count];
+    if (tableView == self.sidebarTableView) {
+        if (section == 0) {
+            return (NSInteger)[RXAASidebarCatalogRows() count];
+        }
+        return 1;
     }
-    return 6;
+
+    if (self.detailMode == RXAAMenuDetailModeTools) {
+        return (NSInteger)[RXAAMenuToolRows() count];
+    }
+    return (NSInteger)[RXAACatalogAllFeaturesForCategory(self.activeCategory) count];
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    return section == 0 ? @"FEATURES" : @"TOOLS";
+    if (tableView == self.sidebarTableView) {
+        if (section == 0) {
+            return @"CATALOG";
+        } else if (section == 1) {
+            return @"ALL DATA";
+        }
+        return @"TOOLS";
+    }
+
+    if (self.detailMode == RXAAMenuDetailModeTools) {
+        return @"TOOLS & ACTIONS";
+    }
+    NSUInteger count = [RXAACatalogAllFeaturesForCategory(self.activeCategory) count];
+    return [NSString stringWithFormat:@"%@  (%lu)",
+            [RXAACatalogCategoryDisplayName(self.activeCategory) uppercaseString],
+            (unsigned long)count];
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
-    if (section == 0) {
-        return @"UI-only demo switches. They save ON/OFF locally and do not hook or modify any game.";
+    if (tableView == self.sidebarTableView) {
+        if (section == 2) {
+            return @"UI-only debug build. No game hooks, no process access, no memory writes.";
+        }
+        return nil;
     }
-    return @"Rxaa UI Debug Menu | Telegram: @kun_amra\nGet Code opens the offline catalog. Python Engine provides terminal CLI & config generation.";
+    if (self.detailMode == RXAAMenuDetailModeTools) {
+        return @"Demo actions only. The Python engine writes local config files; it does not inject into or modify a game.";
+    }
+    return @"Catalog reference rows. Switches save locally and never touch a game process.";
+}
+
+- (void)tableView:(UITableView *)tableView willDisplayHeaderView:(UIView *)view
+       forSection:(NSInteger)section {
+    if (![view isKindOfClass:[UITableViewHeaderFooterView class]]) {
+        return;
+    }
+    UITableViewHeaderFooterView *header = (UITableViewHeaderFooterView *)view;
+    if (tableView == self.sidebarTableView) {
+        header.contentView.backgroundColor = [UIColor colorWithWhite:0.025 alpha:1.0];
+        header.textLabel.textColor = [UIColor colorWithWhite:0.40 alpha:1.0];
+        header.textLabel.font = [UIFont monospacedSystemFontOfSize:9.0
+                                                            weight:UIFontWeightBold];
+    } else {
+        header.contentView.backgroundColor = RXAABackground();
+        header.textLabel.textColor = RXAAGreen();
+        header.textLabel.font = [UIFont monospacedSystemFontOfSize:10.0
+                                                            weight:UIFontWeightBold];
+    }
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    static NSString *cellID = @"RXAACell";
-    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:cellID];
+    if (tableView == self.sidebarTableView) {
+        return [self sidebarCellForRowAtIndexPath:indexPath];
+    }
+    return [self detailCellForRowAtIndexPath:indexPath];
+}
+
+- (UITableViewCell *)sidebarCellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    static NSString *cellID = @"RXAASidebarCell";
+    UITableViewCell *cell = [self.sidebarTableView dequeueReusableCellWithIdentifier:cellID];
     if (!cell) {
-        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:cellID];
-        cell.backgroundColor = [UIColor colorWithWhite:0.04 alpha:1.0];
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
+                                      reuseIdentifier:cellID];
+        cell.backgroundColor = [UIColor colorWithWhite:0.035 alpha:1.0];
         cell.textLabel.textColor = [UIColor whiteColor];
-        cell.detailTextLabel.textColor = [UIColor colorWithWhite:0.62 alpha:1.0];
+        cell.textLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightSemibold];
+        cell.textLabel.adjustsFontSizeToFitWidth = YES;
+        cell.textLabel.minimumScaleFactor = 0.72;
+        cell.detailTextLabel.textColor = [UIColor colorWithWhite:0.48 alpha:1.0];
+        cell.detailTextLabel.font = [UIFont monospacedSystemFontOfSize:9.0
+                                                               weight:UIFontWeightRegular];
+        UIView *selected = [[UIView alloc] init];
+        selected.backgroundColor = [UIColor colorWithRed:0.04 green:0.20 blue:0.12 alpha:1.0];
+        cell.selectedBackgroundView = selected;
     }
 
+    NSDictionary *entry = nil;
+    BOOL isNavigationRow = NO;
     if (indexPath.section == 0) {
-        NSArray<NSString *> *titles = RXAAFeatureTitles();
-        NSArray<NSString *> *keys = RXAAFeatureKeys();
-        BOOL on = [[NSUserDefaults standardUserDefaults] boolForKey:keys[(NSUInteger)indexPath.row]];
-
-        cell.textLabel.text = titles[(NSUInteger)indexPath.row];
-        cell.detailTextLabel.text = on ? @"ON - UI demo" : @"OFF - UI demo";
-        cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        cell.accessoryType = UITableViewCellAccessoryNone;
-
-        UISwitch *sw = [[UISwitch alloc] init];
-        sw.onTintColor = RXAAGreen();
-        sw.tag = indexPath.row;
-        sw.on = on;
-        [sw addTarget:self action:@selector(toggleChanged:) forControlEvents:UIControlEventValueChanged];
-        cell.accessoryView = sw;
-    } else {
-        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-        cell.accessoryView = nil;
-        if (indexPath.row == 0) {
-            cell.textLabel.text = @"Get Code";
-            cell.detailTextLabel.text = @"Browse menu names, addresses and ARM64 xrefs";
-            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        } else if (indexPath.row == 1) {
-            cell.textLabel.text = [NSString stringWithFormat:@"All Features (%lu)",
-                                   (unsigned long)[RXAACatalogFeatures() count]];
-            cell.detailTextLabel.text = @"Browse every catalog feature entry";
-            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        } else if (indexPath.row == 2) {
-            cell.textLabel.text = @"Apply All (Demo)";
-            cell.detailTextLabel.text = @"Turn all demo switches ON";
-            cell.accessoryType = UITableViewCellAccessoryNone;
-        } else if (indexPath.row == 3) {
-            cell.textLabel.text = @"Reset All (Demo)";
-            cell.detailTextLabel.text = @"Turn all demo switches OFF";
-            cell.accessoryType = UITableViewCellAccessoryNone;
-        } else if (indexPath.row == 4) {
-            cell.textLabel.text = @"Python Engine (mod_menu.py)";
-            cell.detailTextLabel.text = @"CLI & Config Generator in Application Support";
-            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        } else {
-            cell.textLabel.text = @"Telegram: @kun_amra";
-            cell.detailTextLabel.text = @"Tap to open official Telegram channel";
-            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        NSArray<NSDictionary *> *rows = RXAASidebarCatalogRows();
+        if ((NSUInteger)indexPath.row < rows.count) {
+            entry = rows[(NSUInteger)indexPath.row];
         }
+    } else if (indexPath.section == 1) {
+        entry = @{
+            @"title": @"Full Catalog",
+            @"subtitle": [NSString stringWithFormat:@"%lu entries",
+                          (unsigned long)[RXAACatalogAllFeatures() count]]
+        };
+        isNavigationRow = YES;
+    } else {
+        entry = @{
+            @"title": @"Tools & Actions",
+            @"subtitle": @"Apply, reset, Python, links"
+        };
+        isNavigationRow = YES;
     }
 
+    cell.textLabel.text = entry[@"title"] ?: @"";
+    cell.detailTextLabel.text = entry[@"subtitle"] ?: @"";
+    cell.accessoryType = isNavigationRow ? UITableViewCellAccessoryDisclosureIndicator
+                                         : UITableViewCellAccessoryNone;
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
     return cell;
 }
 
-- (void)toggleChanged:(UISwitch *)sender {
-    NSArray<NSString *> *keys = RXAAFeatureKeys();
-    if (sender.tag < 0 || sender.tag >= (NSInteger)keys.count) {
-        return;
+- (UITableViewCell *)detailCellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (self.detailMode == RXAAMenuDetailModeTools) {
+        static NSString *toolCellID = @"RXAAToolCell";
+        UITableViewCell *cell = [self.detailTableView dequeueReusableCellWithIdentifier:toolCellID];
+        if (!cell) {
+            cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
+                                          reuseIdentifier:toolCellID];
+            cell.backgroundColor = [UIColor colorWithWhite:0.045 alpha:1.0];
+            cell.textLabel.textColor = [UIColor whiteColor];
+            cell.textLabel.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightSemibold];
+            cell.detailTextLabel.textColor = [UIColor colorWithWhite:0.62 alpha:1.0];
+            cell.detailTextLabel.font = [UIFont systemFontOfSize:11.0];
+        }
+
+        NSArray<NSDictionary *> *rows = RXAAMenuToolRows();
+        if ((NSUInteger)indexPath.row >= rows.count) {
+            return cell;
+        }
+        NSDictionary *row = rows[(NSUInteger)indexPath.row];
+        NSString *action = row[@"action"];
+        cell.textLabel.text = row[@"title"] ?: @"";
+        cell.detailTextLabel.text = row[@"subtitle"] ?: @"";
+        cell.accessoryView = nil;
+        cell.accessoryType = ([action isEqualToString:@"apply-all"] ||
+                              [action isEqualToString:@"reset-all"])
+                                 ? UITableViewCellAccessoryNone
+                                 : UITableViewCellAccessoryDisclosureIndicator;
+        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+        return cell;
     }
 
-    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:keys[(NSUInteger)sender.tag]];
+    static NSString *featureCellID = @"RXAAFeatureCell";
+    UITableViewCell *cell = [self.detailTableView dequeueReusableCellWithIdentifier:featureCellID];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
+                                      reuseIdentifier:featureCellID];
+        cell.backgroundColor = [UIColor colorWithWhite:0.045 alpha:1.0];
+        cell.textLabel.textColor = [UIColor whiteColor];
+        cell.textLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightSemibold];
+        cell.textLabel.numberOfLines = 2;
+        cell.textLabel.adjustsFontSizeToFitWidth = YES;
+        cell.textLabel.minimumScaleFactor = 0.7;
+        cell.detailTextLabel.textColor = [UIColor colorWithWhite:0.58 alpha:1.0];
+        cell.detailTextLabel.font = [UIFont monospacedSystemFontOfSize:9.5
+                                                               weight:UIFontWeightRegular];
+    }
 
-    NSIndexPath *indexPath = [NSIndexPath indexPathForRow:sender.tag inSection:0];
-    UITableViewCell *cell = [self.tableView cellForRowAtIndexPath:indexPath];
-    cell.detailTextLabel.text = sender.isOn ? @"ON - UI demo" : @"OFF - UI demo";
+    NSArray<NSDictionary *> *features = RXAACatalogAllFeaturesForCategory(self.activeCategory);
+    if ((NSUInteger)indexPath.row >= features.count) {
+        return cell;
+    }
+    NSDictionary *item = features[(NSUInteger)indexPath.row];
+    NSString *kind = item[@"kind"] ?: @"entry";
+    NSString *va = item[@"va"] ?: @"";
+    cell.textLabel.text = item[@"label"] ?: @"(unnamed)";
+    cell.detailTextLabel.text = [NSString stringWithFormat:@"%@  |  %@", kind, va];
+    cell.accessoryType = UITableViewCellAccessoryNone;
+    cell.accessoryView = nil;
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+
+    if (RXAACatalogFeatureIsActionable(item)) {
+        RXAACatalogSwitch *sw = [[RXAACatalogSwitch alloc] init];
+        sw.featureKey = RXAACatalogFeatureKey(item);
+        sw.onTintColor = RXAAGreen();
+        sw.on = [[NSUserDefaults standardUserDefaults] boolForKey:sw.featureKey];
+        sw.accessibilityLabel = item[@"label"];
+        [sw addTarget:self
+               action:@selector(catalogSwitchChanged:)
+     forControlEvents:UIControlEventValueChanged];
+        cell.accessoryView = sw;
+    } else {
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    }
+    return cell;
 }
 
-- (void)setAllDemoSwitches:(BOOL)on {
+- (void)catalogSwitchChanged:(UISwitch *)sender {
+    if (![sender isKindOfClass:[RXAACatalogSwitch class]]) {
+        return;
+    }
+    RXAACatalogSwitch *sw = (RXAACatalogSwitch *)sender;
+    if (!sw.featureKey) {
+        return;
+    }
+    [[NSUserDefaults standardUserDefaults] setBool:sw.isOn forKey:sw.featureKey];
+}
+
+- (NSUInteger)setAllDemoSwitches:(BOOL)on {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     for (NSString *key in RXAAFeatureKeys()) {
         [defaults setBool:on forKey:key];
     }
-    for (NSDictionary *item in RXAACatalogFeatures()) {
+    NSUInteger count = 0;
+    for (NSDictionary *item in RXAACatalogAllFeatures()) {
         if (RXAACatalogFeatureIsActionable(item)) {
             [defaults setBool:on forKey:RXAACatalogFeatureKey(item)];
+            count++;
         }
     }
-    [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:0]
-                  withRowAnimation:UITableViewRowAnimationNone];
+    [defaults synchronize];
+    [self.sidebarTableView reloadData];
+    [self.detailTableView reloadData];
+    [self selectActiveSidebarRow];
+    return count;
+}
+
+- (void)showDemoActionAlert:(BOOL)on count:(NSUInteger)count {
+    NSString *title = on ? @"Applied (Demo)" : @"Reset (Demo)";
+    NSString *message = [NSString stringWithFormat:
+        @"%lu local catalog switches were turned %@.\n\nThis only writes NSUserDefaults. No game process is contacted.",
+        (unsigned long)count, on ? @"ON" : @"OFF"];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
+                                                                   message:message
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                              style:UIAlertActionStyleDefault
+                                            handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)showFeatureDetails:(NSDictionary *)item {
+    NSMutableString *message = [NSMutableString string];
+    NSString *category = item[@"category"] ?: @"unknown";
+    NSString *kind = item[@"kind"] ?: @"entry";
+    NSString *va = item[@"va"] ?: @"n/a";
+    NSString *firstXref = item[@"first_xref"] ?: @"n/a";
+    [message appendFormat:@"Category: %@\nKind: %@\nString VA: %@\nFirst xref: %@",
+                          category, kind, va, firstXref];
+    NSDictionary *meta = item[@"meta"];
+    if ([meta isKindOfClass:[NSDictionary class]] && meta.count > 0) {
+        [message appendString:@"\n\nMetadata:"];
+        for (NSString *key in [meta.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+            [message appendFormat:@"\n%@: %@", key, meta[key]];
+        }
+    }
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:item[@"label"] ?: @"Catalog Entry"
+                                                                   message:message
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                              style:UIAlertActionStyleDefault
+                                            handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)showPythonEngineInfo {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Rxa Python Engine"
+        message:@"mod_menu.py is bundled in the tweak's Application Support directory.\n\nTo run on iOS:\n1. Open Terminal (NewTerm or SSH)\n2. Type 'rxa-menu'\n   (or python3 mod_menu.py --cli)\n\nIt provides the interactive CLI, preset loading, and local config generation. It does not inject into a game."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                              style:UIAlertActionStyleDefault
+                                            handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)showAbout {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"About Rxaa"
+        message:@"Rxaa 1.3.1 UI debug build\n\nTwo-pane catalog browser for libRAACHEAT.so and ROS.deb reference data. The ros.dylib in the extracted package is not loaded, hooked, or signed into any game process.\n\nUI-only: no aimbot, ESP, memory read/write, or anti-cheat bypass."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                              style:UIAlertActionStyleDefault
+                                            handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)showRepairOverlayDiagnostics {
+    RAACHEATAttachWindowToScene();
+    RAACHEATEnsureOverlayVisible();
+
+    NSString *sceneDesc = @"none";
+    if (@available(iOS 13.0, *)) {
+        UIWindowScene *scene = gOverlayWindow.windowScene;
+        if (scene) {
+            sceneDesc = [NSString stringWithFormat:@"scene=%p active=%@ bounds=%@",
+                         scene, @(scene.activationState == UISceneActivationStateForegroundActive),
+                         NSStringFromCGRect(scene.coordinateSpace.bounds)];
+        }
+    }
+
+    NSString *message = [NSString stringWithFormat:
+        @"Overlay repair attempted.\n\n"
+        @"Overlay: %@\n"
+        @"Button: %@\n"
+        @"Menu open: %@\n"
+        @"Overlay scene: %@\n"
+        @"Using legacy windows: %@\n"
+        @"Install attempts: %d",
+        gOverlayWindow ? @"installed" : @"nil",
+        gButtonWindow ? @"installed" : @"nil",
+        gMenuNav ? @"YES" : @"NO",
+        sceneDesc,
+        gUsingLegacyWindows ? @"YES" : @"NO",
+        gInstallAttempts];
+
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Repair / Reattach Overlay"
+                                                                    message:message
+                                                             preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                          style:UIAlertActionStyleDefault
+                                        handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)showGameStatusDiagnostics {
+    NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"(unknown)";
+    NSUInteger sceneCount = 0, windowCount = 0, nonRxaaWindowCount = 0;
+    if (@available(iOS 13.0, *)) {
+        sceneCount = [UIApplication sharedApplication].connectedScenes.count;
+        for (UIWindow *window in [UIApplication sharedApplication].windows) {
+            windowCount++;
+            if (!RAACHEATIsRxaaWindow(window)) {
+                nonRxaaWindowCount++;
+            }
+        }
+    } else {
+        windowCount = [UIApplication sharedApplication].windows.count;
+        for (UIWindow *window in [UIApplication sharedApplication].windows) {
+            if (!RAACHEATIsRxaaWindow(window)) {
+                nonRxaaWindowCount++;
+            }
+        }
+    }
+
+    BOOL rosDylibLoaded = NSClassFromString(@"DLGMem") != nil || NSClassFromString(@"DLGMemUIView") != nil;
+    BOOL sclLoaded = NSClassFromString(@"SCLAlertView") != nil;
+
+    NSString *message = [NSString stringWithFormat:
+        @"Game Status & Diagnostics\n\n"
+        @"Bundle ID: %@\n"
+        @"App State: %@\n"
+        @"Scenes: %lu\n"
+        @"Windows: %lu (game: %lu)\n"
+        @"Overlay: %@\n"
+        @"Button: %@\n"
+        @"Menu open: %@\n"
+        @"ros.dylib detected: %@\n"
+        @"SCLAlertView loaded: %@\n\n"
+        @"Note: Rxaa is UI-only. Switches write NSUserDefaults locally and do not hook the game process. If ros.dylib is loaded, it provides its own memory-scanner menu independently.",
+        bundleID,
+        @([[UIApplication sharedApplication].applicationState == UIApplicationStateActive]),
+        (unsigned long)sceneCount,
+        (unsigned long)windowCount,
+        (unsigned long)nonRxaaWindowCount,
+        gOverlayWindow ? @"YES" : @"NO",
+        gButtonWindow ? @"YES" : @"NO",
+        gMenuNav ? @"YES" : @"NO",
+        rosDylibLoaded ? @"YES (DLGMem/DLGMemUIView)" : @"NO",
+        sclLoaded ? @"YES" : @"NO"];
+
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Game Status & Diagnostics"
+                                                                    message:message
+                                                             preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                          style:UIAlertActionStyleDefault
+                                        handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)handleToolAction:(NSString *)action {
+    if ([action isEqualToString:@"apply-all"]) {
+        NSUInteger count = [self setAllDemoSwitches:YES];
+        [self showDemoActionAlert:YES count:count];
+    } else if ([action isEqualToString:@"reset-all"]) {
+        NSUInteger count = [self setAllDemoSwitches:NO];
+        [self showDemoActionAlert:NO count:count];
+    } else if ([action isEqualToString:@"get-code"]) {
+        RXAACatalogViewController *catalog = [[RXAACatalogViewController alloc] init];
+        [self.navigationController pushViewController:catalog animated:YES];
+    } else if ([action isEqualToString:@"all-features"]) {
+        RXAACatalogFeatureViewController *features = [[RXAACatalogFeatureViewController alloc] init];
+        features.showsAllCategories = YES;
+        [self.navigationController pushViewController:features animated:YES];
+    } else if ([action isEqualToString:@"python"]) {
+        [self showPythonEngineInfo];
+    } else if ([action isEqualToString:@"telegram"]) {
+        NSURL *url = [NSURL URLWithString:@"https://t.me/kun_amra"];
+        if (!url) {
+            return;
+        }
+        [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:^(BOOL success) {
+            if (success) {
+                return;
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIAlertController *alert = [UIAlertController
+                    alertControllerWithTitle:@"Telegram"
+                                     message:@"Could not open https://t.me/kun_amra on this device."
+                              preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                          style:UIAlertActionStyleDefault
+                                                        handler:nil]];
+                [self presentViewController:alert animated:YES completion:nil];
+            });
+        }];
+    } else if ([action isEqualToString:@"repair-overlay"]) {
+        [self showRepairOverlayDiagnostics];
+    } else if ([action isEqualToString:@"game-status"]) {
+        [self showGameStatusDiagnostics];
+    } else if ([action isEqualToString:@"about"]) {
+        [self showAbout];
+    }
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    if (indexPath.section == 1) {
-        if (indexPath.row == 0) {
-            RXAACatalogViewController *catalog = [[RXAACatalogViewController alloc] init];
-            [self.navigationController pushViewController:catalog animated:YES];
-        } else if (indexPath.row == 1) {
+    if (tableView == self.sidebarTableView) {
+        if (indexPath.section == 0) {
+            NSArray<NSDictionary *> *rows = RXAASidebarCatalogRows();
+            if ((NSUInteger)indexPath.row >= rows.count) {
+                return;
+            }
+            self.activeCategory = rows[(NSUInteger)indexPath.row][@"key"];
+            self.detailMode = RXAAMenuDetailModeCatalog;
+            [self.detailTableView reloadData];
+            [self.detailTableView setContentOffset:CGPointZero animated:NO];
+            [self selectActiveSidebarRow];
+        } else if (indexPath.section == 1) {
+            [tableView deselectRowAtIndexPath:indexPath animated:YES];
             RXAACatalogFeatureViewController *features = [[RXAACatalogFeatureViewController alloc] init];
+            features.showsAllCategories = YES;
             [self.navigationController pushViewController:features animated:YES];
-        } else if (indexPath.row == 2 || indexPath.row == 3) {
-            [self setAllDemoSwitches:(indexPath.row == 2)];
-        } else if (indexPath.row == 4) {
-            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Rxa Python Engine"
-                message:@"mod_menu.py is bundled in your tweak Application Support directory.\n\nTo run on iOS:\n1. Open Terminal (NewTerm or SSH)\n2. Type 'rxa-menu'\n   (or python3 mod_menu.py --cli)\n\nSupports full interactive CLI, preset loading, and config file generation."
-                preferredStyle:UIAlertControllerStyleAlert];
-            [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-            [self presentViewController:alert animated:YES completion:nil];
-        } else if (indexPath.row == 5) {
-            NSURL *url = [NSURL URLWithString:@"https://t.me/kun_amra"];
-            [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
+            [self selectActiveSidebarRow];
+        } else {
+            self.detailMode = RXAAMenuDetailModeTools;
+            [self.detailTableView reloadData];
+            [self.detailTableView setContentOffset:CGPointZero animated:NO];
+            [self selectActiveSidebarRow];
         }
+        return;
+    }
+
+    if (self.detailMode == RXAAMenuDetailModeTools) {
+        NSArray<NSDictionary *> *rows = RXAAMenuToolRows();
+        if ((NSUInteger)indexPath.row < rows.count) {
+            [tableView deselectRowAtIndexPath:indexPath animated:YES];
+            [self handleToolAction:rows[(NSUInteger)indexPath.row][@"action"]];
+        }
+        return;
+    }
+
+    NSArray<NSDictionary *> *features = RXAACatalogAllFeaturesForCategory(self.activeCategory);
+    if ((NSUInteger)indexPath.row < features.count) {
+        [tableView deselectRowAtIndexPath:indexPath animated:YES];
+        [self showFeatureDetails:features[(NSUInteger)indexPath.row]];
     }
 }
 
@@ -848,6 +1547,7 @@ static NSArray<NSString *> *RXAAFeatureKeys(void) {
 
 @end
 
+
 @implementation RXAACatalogSwitch
 @end
 
@@ -855,31 +1555,62 @@ static NSArray<NSString *> *RXAAFeatureKeys(void) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"All Features";
+
+    NSArray<NSString *> *categories = self.showsAllCategories ? RXAACatalogAllCategories()
+                                                              : RXAACatalogCategories();
+    NSMutableArray<NSString *> *visible = [NSMutableArray array];
+    for (NSString *category in categories) {
+        if ([[self featuresForCategory:category] count] > 0) {
+            [visible addObject:category];
+        }
+    }
+    self.visibleCategories = visible.count > 0 ? [visible copy] : categories;
+    self.title = self.showsAllCategories
+        ? [NSString stringWithFormat:@"Full Catalog (%lu)",
+           (unsigned long)[RXAACatalogAllFeatures() count]]
+        : [NSString stringWithFormat:@"All Features (%lu)",
+           (unsigned long)[RXAACatalogFeatures() count]];
     self.tableView.backgroundColor = RXAABackground();
     self.tableView.separatorColor = [UIColor colorWithWhite:0.18 alpha:1.0];
     self.tableView.tableFooterView = [[UIView alloc] init];
-    self.tableView.rowHeight = 58.0;
+    self.tableView.rowHeight = 60.0;
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self.tableView reloadData];
+}
+
+- (NSArray<NSString *> *)catalogCategories {
+    if (self.visibleCategories.count > 0) {
+        return self.visibleCategories;
+    }
+    return self.showsAllCategories ? RXAACatalogAllCategories() : RXAACatalogCategories();
+}
+
+- (NSArray<NSDictionary *> *)featuresForCategory:(NSString *)category {
+    return self.showsAllCategories ? RXAACatalogAllFeaturesForCategory(category)
+                                   : RXAACatalogFeaturesForCategory(category);
 }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
-    return (NSInteger)[RXAACatalogCategories() count];
+    return (NSInteger)[[self catalogCategories] count];
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    NSArray<NSString *> *categories = RXAACatalogCategories();
+    NSArray<NSString *> *categories = [self catalogCategories];
     if (section < 0 || section >= (NSInteger)categories.count) {
         return 0;
     }
-    return (NSInteger)[RXAACatalogFeaturesForCategory(categories[(NSUInteger)section]) count];
+    return (NSInteger)[[self featuresForCategory:categories[(NSUInteger)section]] count];
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    NSArray<NSString *> *categories = RXAACatalogCategories();
+    NSArray<NSString *> *categories = [self catalogCategories];
     if (section < 0 || section >= (NSInteger)categories.count) {
         return nil;
     }
-    return [categories[(NSUInteger)section] uppercaseString];
+    return [RXAACatalogCategoryDisplayName(categories[(NSUInteger)section]) uppercaseString];
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
@@ -887,6 +1618,18 @@ static NSArray<NSString *> *RXAAFeatureKeys(void) {
         return @"UI-only demo entries. Switches save locally; no game hooks or memory access.";
     }
     return nil;
+}
+
+- (void)tableView:(UITableView *)tableView willDisplayHeaderView:(UIView *)view
+       forSection:(NSInteger)section {
+    if (![view isKindOfClass:[UITableViewHeaderFooterView class]]) {
+        return;
+    }
+    UITableViewHeaderFooterView *header = (UITableViewHeaderFooterView *)view;
+    header.contentView.backgroundColor = RXAABackground();
+    header.textLabel.textColor = RXAAGreen();
+    header.textLabel.font = [UIFont monospacedSystemFontOfSize:10.0
+                                                        weight:UIFontWeightBold];
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -901,11 +1644,11 @@ static NSArray<NSString *> *RXAAFeatureKeys(void) {
         cell.textLabel.minimumScaleFactor = 0.72;
     }
 
-    NSArray<NSString *> *categories = RXAACatalogCategories();
+    NSArray<NSString *> *categories = [self catalogCategories];
     if (indexPath.section < 0 || indexPath.section >= (NSInteger)categories.count) {
         return cell;
     }
-    NSArray<NSDictionary *> *features = RXAACatalogFeaturesForCategory(categories[(NSUInteger)indexPath.section]);
+    NSArray<NSDictionary *> *features = [self featuresForCategory:categories[(NSUInteger)indexPath.section]];
     if (indexPath.row < 0 || indexPath.row >= (NSInteger)features.count) {
         return cell;
     }
@@ -914,10 +1657,12 @@ static NSArray<NSString *> *RXAAFeatureKeys(void) {
     NSString *label = item[@"label"];
     NSString *category = item[@"category"];
     NSString *kind = item[@"kind"];
+    NSString *va = item[@"va"];
     cell.textLabel.text = label ? label : @"(unnamed)";
     category = category ? category : @"feature";
     kind = kind ? kind : @"entry";
-    cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ - %@ - UI demo", category, kind];
+    va = va ? va : @"";
+    cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ - %@ - %@", category, kind, va];
     cell.accessoryType = UITableViewCellAccessoryNone;
     cell.accessoryView = nil;
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
@@ -962,7 +1707,7 @@ static NSArray<NSString *> *RXAAFeatureKeys(void) {
 - (void)viewDidLoad {
     [super viewDidLoad];
 
-    self.title = @"Code Catalog";
+    self.title = @"Offline Catalog";
     self.view.backgroundColor = [UIColor blackColor];
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc]
         initWithTitle:@"Close"
@@ -975,15 +1720,77 @@ static NSArray<NSString *> *RXAAFeatureKeys(void) {
     self.webView.opaque = NO;
     self.webView.backgroundColor = [UIColor blackColor];
     self.webView.scrollView.backgroundColor = [UIColor blackColor];
+    self.webView.navigationDelegate = self;
     [self.view addSubview:self.webView];
 
-    NSURL *url = [NSURL fileURLWithPath:RAACHEATCatalogPath()];
+    self.errorLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    self.errorLabel.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    self.errorLabel.numberOfLines = 0;
+    self.errorLabel.textAlignment = NSTextAlignmentCenter;
+    self.errorLabel.textColor = [UIColor colorWithWhite:0.78 alpha:1.0];
+    self.errorLabel.font = [UIFont monospacedSystemFontOfSize:12.0 weight:UIFontWeightRegular];
+    self.errorLabel.hidden = YES;
+    [self.view addSubview:self.errorLabel];
+
+    NSString *path = RAACHEATCatalogPath();
+    if (!path) {
+        [self showCatalogError:@"Offline catalog not found.\n\nReinstall the Rxaa package and verify that one of these files exists:\n\n/var/jb/Library/Application Support/RAACHEATMenuDebug/index.html\n/Library/Application Support/RAACHEATMenuDebug/index.html"];
+        return;
+    }
+
+    NSURL *url = [NSURL fileURLWithPath:path];
+    if (!url) {
+        [self showCatalogError:@"Offline catalog path is invalid.\n\nReinstall the Rxaa package."];
+        return;
+    }
+    NSLog(@"[Rxaa] loading offline catalog: %@", path);
     [self.webView loadFileURL:url allowingReadAccessToURL:[url URLByDeletingLastPathComponent]];
+}
+
+- (void)showCatalogError:(NSString *)message {
+    NSLog(@"[Rxaa] catalog error: %@",
+          [message stringByReplacingOccurrencesOfString:@"\n" withString:@" "]);
+    self.webView.hidden = YES;
+    self.errorLabel.text = message;
+    self.errorLabel.hidden = NO;
+    [self.view bringSubviewToFront:self.errorLabel];
 }
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     self.webView.frame = self.view.bounds;
+    UIEdgeInsets safe = UIEdgeInsetsZero;
+    if (@available(iOS 11.0, *)) {
+        safe = self.view.safeAreaInsets;
+    }
+    self.errorLabel.frame = UIEdgeInsetsInsetRect(self.view.bounds,
+        UIEdgeInsetsMake(safe.top + 24.0, safe.left + 24.0,
+                         safe.bottom + 24.0, safe.right + 24.0));
+}
+
+- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
+    (void)webView;
+    (void)navigation;
+    self.errorLabel.hidden = YES;
+    self.webView.hidden = NO;
+}
+
+- (void)webView:(WKWebView *)webView
+    didFailProvisionalNavigation:(WKNavigation *)navigation
+                       withError:(NSError *)error {
+    (void)webView;
+    (void)navigation;
+    [self showCatalogError:[NSString stringWithFormat:
+        @"Could not load the offline catalog.\n\n%@\n\nReinstall the Rxaa package if this file is missing:\nindex.html", error.localizedDescription]];
+}
+
+- (void)webView:(WKWebView *)webView
+    didFailNavigation:(WKNavigation *)navigation
+            withError:(NSError *)error {
+    (void)webView;
+    (void)navigation;
+    [self showCatalogError:[NSString stringWithFormat:
+        @"Could not load the offline catalog.\n\n%@", error.localizedDescription]];
 }
 
 - (void)closeMenu {
@@ -1006,7 +1813,41 @@ static NSArray<NSString *> *RXAAFeatureKeys(void) {
 static UIWindowScene *RAACHEATActiveWindowScene(void) {
     if (@available(iOS 13.0, *)) {
         UIApplication *app = [UIApplication sharedApplication];
+
+        // Prefer the scene that owns the game's key window. This matters when a
+        // game swaps scenes after a match starts and the first active scene is
+        // not the one currently rendering the game.
+        UIWindow *keyWindow = RAACHEATKeyWindowForScene(nil);
+        if (keyWindow.windowScene) {
+            return keyWindow.windowScene;
+        }
+
         UIWindowScene *fallback = nil;
+        BOOL fallbackVisible = NO;
+        CGFloat bestArea = 0.0;
+        for (UIWindow *window in app.windows) {
+            if (RAACHEATIsRxaaWindow(window) || !window.windowScene) {
+                continue;
+            }
+            UIWindowScene *windowScene = window.windowScene;
+            if (windowScene.activationState == UISceneActivationStateUnattached) {
+                continue;
+            }
+            CGRect bounds = windowScene.coordinateSpace.bounds;
+            CGFloat area = CGRectGetWidth(bounds) * CGRectGetHeight(bounds);
+            BOOL visible = !window.hidden;
+            if (!fallback ||
+                (visible && !fallbackVisible) ||
+                (visible == fallbackVisible && area > bestArea)) {
+                fallback = windowScene;
+                fallbackVisible = visible;
+                bestArea = area;
+            }
+        }
+        if (fallback) {
+            return fallback;
+        }
+
         for (UIScene *scene in app.connectedScenes) {
             if (![scene isKindOfClass:[UIWindowScene class]]) {
                 continue;
@@ -1019,14 +1860,7 @@ static UIWindowScene *RAACHEATActiveWindowScene(void) {
                 fallback = windowScene;
             }
         }
-        if (fallback) {
-            return fallback;
-        }
-        for (UIWindow *window in app.windows) {
-            if (window.windowScene) {
-                return window.windowScene;
-            }
-        }
+        return fallback;
     }
     return nil;
 }
@@ -1089,29 +1923,38 @@ static void RAACHEATAttachWindowToScene(void) {
     if (!gOverlayWindow) {
         return;
     }
+
+    UIWindowScene *scene = nil;
     if (@available(iOS 13.0, *)) {
-        UIWindowScene *scene = RAACHEATActiveWindowScene();
-        if (!scene) {
-            return;
+        scene = RAACHEATActiveWindowScene();
+        if (scene) {
+            gUsingLegacyWindows = NO;
+            if (gOverlayWindow.windowScene != scene) {
+                gOverlayWindow.windowScene = scene;
+            }
+            if (gButtonWindow && gButtonWindow.windowScene != scene) {
+                gButtonWindow.windowScene = scene;
+            }
+            CGRect bounds = scene.coordinateSpace.bounds;
+            if (!CGRectIsEmpty(bounds)) {
+                gOverlayWindow.frame = bounds;
+            }
         }
-        if (gOverlayWindow.windowScene != scene) {
-            gOverlayWindow.windowScene = scene;
-        }
-        if (gButtonWindow.windowScene != scene) {
-            gButtonWindow.windowScene = scene;
-        }
-        CGRect bounds = scene.coordinateSpace.bounds;
-        if (!CGRectIsEmpty(bounds)) {
-            gOverlayWindow.frame = bounds;
-        }
-        UIViewController *root = gOverlayWindow.rootViewController;
-        root.view.frame = gOverlayWindow.bounds;
-        RAACHEATInstallOpenGesture((RAACHEATRootController *)root, scene);
     }
 
-    gOverlayWindow.windowLevel = UIWindowLevelAlert + 100.0;
+    CGRect bounds = gOverlayWindow.bounds;
+    if (CGRectIsEmpty(bounds)) {
+        bounds = RAACHEATScreenBounds();
+    }
+    UIViewController *root = gOverlayWindow.rootViewController;
+    if (root && !CGRectIsEmpty(bounds)) {
+        root.view.frame = bounds;
+    }
+    RAACHEATInstallOpenGesture((RAACHEATRootController *)root, scene);
+
+    gOverlayWindow.windowLevel = UIWindowLevelAlert + 1000.0;
     if (gButtonWindow) {
-        gButtonWindow.windowLevel = UIWindowLevelAlert + 101.0;
+        gButtonWindow.windowLevel = UIWindowLevelAlert + 1001.0;
         if (gMenuNav) {
             gOverlayWindow.hidden = NO;
             gButtonWindow.hidden = YES;
@@ -1124,8 +1967,21 @@ static void RAACHEATAttachWindowToScene(void) {
 }
 
 static void RAACHEATEnsureOverlayVisible(void) {
-    if (!gOverlayWindow) {
+    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
         return;
+    }
+    if (!gOverlayWindow) {
+        RAACHEATTryInstall();
+        return;
+    }
+
+    UIViewController *root = gOverlayWindow.rootViewController;
+    if (!gMenuDismissing && root.presentedViewController) {
+        if (!gMenuNav || root.presentedViewController != gMenuNav) {
+            NSLog(@"[Rxaa] clearing stale presentation: %@", root.presentedViewController);
+            gMenuNav = nil;
+            [root dismissViewControllerAnimated:NO completion:nil];
+        }
     }
 
     RAACHEATAttachWindowToScene();
@@ -1145,7 +2001,7 @@ static void RAACHEATEnsureOverlayVisible(void) {
 }
 
 static void RAACHEATInstallOverlay(void) {
-    if (gOverlayWindow || gInstallAttempts++ > 40) {
+    if (gOverlayWindow) {
         return;
     }
 
@@ -1158,16 +2014,19 @@ static void RAACHEATInstallOverlay(void) {
     if (@available(iOS 13.0, *)) {
         scene = RAACHEATActiveWindowScene();
         if (scene) {
+            gUsingLegacyWindows = NO;
             gOverlayWindow = [[UIWindow alloc] initWithWindowScene:scene];
         } else if (app.windows.count > 0) {
             // Older/legacy apps can have windows without adopting UIScene.
             NSLog(@"[Rxaa] no UIWindowScene; using legacy window fallback");
+            gUsingLegacyWindows = YES;
             gOverlayWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
         } else {
             NSLog(@"[Rxaa] waiting for active UIWindowScene");
             return;
         }
     } else {
+        gUsingLegacyWindows = YES;
         gOverlayWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     }
 
@@ -1177,7 +2036,7 @@ static void RAACHEATInstallOverlay(void) {
     }
 
     gOverlayWindow.frame = bounds;
-    gOverlayWindow.windowLevel = UIWindowLevelAlert + 100.0;
+    gOverlayWindow.windowLevel = UIWindowLevelAlert + 1000.0;
     gOverlayWindow.backgroundColor = [UIColor clearColor];
     gOverlayWindow.rootViewController = [[RAACHEATRootController alloc] init];
     gOverlayWindow.hidden = YES;
@@ -1222,7 +2081,7 @@ static void RAACHEATInstallOverlay(void) {
     }
     gButtonWindow.frame = CGRectMake(0.0, 0.0,
                                      kRXAAFloatButtonSize, kRXAAFloatButtonSize);
-    gButtonWindow.windowLevel = UIWindowLevelAlert + 101.0;
+    gButtonWindow.windowLevel = UIWindowLevelAlert + 1001.0;
     gButtonWindow.backgroundColor = [UIColor clearColor];
     gButtonWindow.rootViewController = buttonRoot;
     gButtonWindow.hidden = NO;
@@ -1246,25 +2105,58 @@ static void RAACHEATInstallOverlay(void) {
     NSLog(@"[Rxaa] overlay installed scene=%@ bounds=%@", scene, NSStringFromCGRect(bounds));
 }
 
+static void RAACHEATScheduleInstallRetry(void) {
+    if (gInstallRetryScheduled) {
+        return;
+    }
+    gInstallRetryScheduled = YES;
+
+    NSTimeInterval delay = 1.0;
+    if (gInstallAttempts > 10) {
+        delay = 2.0;
+    }
+    if (gInstallAttempts > 30) {
+        delay = 5.0;
+    }
+    if (gInstallAttempts > 60) {
+        delay = 10.0;
+    }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        gInstallRetryScheduled = NO;
+        RAACHEATTryInstall();
+    });
+}
+
 static void RAACHEATTryInstall(void) {
+    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
+        RAACHEATScheduleInstallRetry();
+        return;
+    }
+
     if (gOverlayWindow) {
         RAACHEATAttachWindowToScene();
         if (@available(iOS 13.0, *)) {
-            if (!gOverlayWindow.windowScene && gInstallAttempts <= 40) {
+            BOOL needsScene = !gOverlayWindow.windowScene && !gUsingLegacyWindows;
+            BOOL needsButton = gButtonWindow == nil;
+            if (needsScene || needsButton) {
                 gInstallAttempts++;
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    RAACHEATTryInstall();
-                });
+                RAACHEATScheduleInstallRetry();
             }
         }
         return;
     }
+
+    gInstallAttempts++;
     RAACHEATInstallOverlay();
     if (!gOverlayWindow) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            RAACHEATTryInstall();
-        });
+        RAACHEATScheduleInstallRetry();
+        return;
     }
+
+    gInstallAttempts = 0;
+    RAACHEATEnsureOverlayVisible();
 }
 
 static void RAACHEATObserveLifecycle(void) {
@@ -1275,7 +2167,9 @@ static void RAACHEATObserveLifecycle(void) {
                                                 object:nil
                                                  queue:[NSOperationQueue mainQueue]
                                             usingBlock:^(NSNotification *note) {
+            (void)note;
             gInstallAttempts = 0;
+            gMenuDismissing = NO;
             if (gOverlayWindow) {
                 RAACHEATEnsureOverlayVisible();
             } else {
@@ -1284,11 +2178,21 @@ static void RAACHEATObserveLifecycle(void) {
         }];
         (void)activationToken;
 
+        id resignationToken = [center addObserverForName:UIApplicationWillResignActiveNotification
+                                                  object:nil
+                                                   queue:[NSOperationQueue mainQueue]
+                                              usingBlock:^(NSNotification *note) {
+            (void)note;
+            RAACHEATDismissMenuForResignation();
+        }];
+        (void)resignationToken;
+
         if (@available(iOS 13.0, *)) {
             id sceneToken = [center addObserverForName:UISceneDidActivateNotification
                                                 object:nil
                                                  queue:[NSOperationQueue mainQueue]
                                             usingBlock:^(NSNotification *note) {
+                (void)note;
                 gInstallAttempts = 0;
                 if (gOverlayWindow) {
                     RAACHEATEnsureOverlayVisible();
@@ -1304,11 +2208,17 @@ static void RAACHEATObserveLifecycle(void) {
                                            queue:[NSOperationQueue mainQueue]
                                       usingBlock:^(NSNotification *note) {
             if (!gOverlayWindow) {
+                RAACHEATTryInstall();
                 return;
             }
             if ([note.object isKindOfClass:[UIWindow class]] &&
-                (note.object == gOverlayWindow || note.object == gButtonWindow)) {
+                RAACHEATIsRxaaWindow((UIWindow *)note.object)) {
                 return;
+            }
+            if (gMenuNav && [note.object isKindOfClass:[UIWindow class]]) {
+                // The game created or promoted a new window after the menu was
+                // opened. Remember it so closing the menu returns to the right one.
+                gPreviousKeyWindow = (UIWindow *)note.object;
             }
             RAACHEATEnsureOverlayVisible();
         }];
@@ -1319,10 +2229,11 @@ static void RAACHEATObserveLifecycle(void) {
                                                queue:[NSOperationQueue mainQueue]
                                           usingBlock:^(NSNotification *note) {
             if (!gOverlayWindow) {
+                RAACHEATTryInstall();
                 return;
             }
             if ([note.object isKindOfClass:[UIWindow class]] &&
-                (note.object == gOverlayWindow || note.object == gButtonWindow)) {
+                RAACHEATIsRxaaWindow((UIWindow *)note.object)) {
                 return;
             }
             RAACHEATEnsureOverlayVisible();
@@ -1341,6 +2252,8 @@ static void RAACHEATObserveLifecycle(void) {
                         RAACHEATEnsureOverlayVisible();
                     }
                 });
+            } else {
+                RAACHEATTryInstall();
             }
         }];
         (void)orientationToken;

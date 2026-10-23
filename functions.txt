@@ -1,30 +1,32 @@
 RXAA iOS MENU - FUNCTION REFERENCE
 ==================================
 Generated: 2026-10-23
-Updated:   2026-10-23 for Rxaa 1.2.5
+Updated:   2026-10-23 for Rxaa 1.3.1
 Project:   C:\Users\PC\Desktop\Roses-Mod-Menu-master\RAACHEAT_iOS_Menu_Debug
 Primary:   Tweak.x
 Web app:   layout\Library\Application Support\RAACHEATMenuDebug\index.html
+Preview:   preview\catalog_sidebar_preview.html
 
 Use the signature to locate a function; line numbers are intentionally not
 tracked because this file is updated independently of Tweak.x.
 
 SCOPE
 -----
-This file documents every function and method defined in the Rxaa iOS tweak
-and its embedded HTML/JavaScript catalog.
+This file documents the functions and methods defined in the Rxaa iOS tweak
+and the embedded HTML/JavaScript catalog. It covers the floating icon, the
+two-pane native menu, the catalog sidebar, the Full Catalog browser, the ON/OFF
+demo switches, the Get Code WebView, and the retry/lifecycle flow.
 
 It does NOT document the thousands of internal functions in libRAACHEAT.so.
-That is separate native reverse-engineering work. This is the UI/build layer:
-the floating icon, the native Rxaa list, the All Features browser, the ON/OFF
-switches, the Get Code catalog WebView, and the retry/install flow.
+That is separate native reverse-engineering work and is not part of this
+UI-only project.
 
 SAFETY NOTE
 -----------
-Rxaa is UI-only. The AimLock/ESP/Radar switches save a boolean in
-NSUserDefaults and change a label. The All Features switches do the same for
-catalog entries. They do not hook a game, read/write game memory, or perform
-aimbot/ESP behavior.
+Rxaa is UI-only. The switches save booleans in NSUserDefaults and refresh a
+label. The catalog switches do the same for catalog entries. They do not hook
+a game, read/write game memory, or perform aimbot/ESP behavior. The ros.dylib
+inside ROS.deb is not loaded, hooked, signed, or injected by this project.
 
 FILES
 -----
@@ -32,10 +34,17 @@ Tweak.x
   Theos/Logos tweak source. All Objective-C functions below are here.
 
 layout/Library/Application Support/RAACHEATMenuDebug/index.html
-  Offline catalog app. Contains the JavaScript functions in Part 2.
+  Offline catalog app used by Get Code. Contains the JavaScript functions in
+  Part 2.
 
-layout/Library/Application Support/RAACHEATMenuDebug/menu_icon.png
-  192x192 floating-button icon generated from menu_image.jpg.
+layout/Library/Application Support/RAACHEATMenuDebug/menu_catalog.json
+  Single data store: 197 entries across 10 categories.
+
+layout/Library/Application Support/RAACHEATMenuDebug/build_info.json
+  Package/catalog metadata, version 1.3.0.
+
+preview/catalog_sidebar_preview.html
+  Standalone sample of the two-pane sidebar UI. Sample data only.
 
 RAACHEATMenuDebug.plist
   Cydia Substrate/ElleKit filter. Targets com.apple.UIKit.
@@ -43,7 +52,7 @@ RAACHEATMenuDebug.plist
 control
   Package: com.rxaa.menudebug
   Name: Rxaa
-  Version: 1.2.5
+  Version: 1.3.0
 
 GLOBAL STATE (Tweak.x)
 ----------------------
@@ -63,8 +72,9 @@ gFloatButton
   saved in NSUserDefaults and clamped to the screen safe area.
 
 gMenuNav
-  The currently presented UINavigationController containing the Rxaa list.
-  nil when no menu is open. Set back to nil after dismissal.
+  The currently presented RXAANavigationController containing the two-pane
+  menu. nil when no menu is open. Cleared after dismissal and on app
+  resignation.
 
 gOpenGesture
   Four-finger triple-tap recognizer installed on the host app window. It is a
@@ -96,1465 +106,712 @@ STARTUP / CALL FLOW
    four-finger triple-tap fallback gesture on the host window.
 6. Tapping the button sends -raacheatOpen to RAACHEATButtonController; the
    fallback gesture sends -raacheatOpen to RAACHEATRootController.
-7. Both -raacheatOpen methods call RAACHEATOpenPanel.
-8. RAACHEATOpenPanel presents RXAAMenuViewController inside a
-   UINavigationController.
-9. The table shows AimLock/ESP/Radar switches, Get Code, All Features,
-   Apply All (Demo), Reset All (Demo), Python Engine, and Telegram.
-10. Tapping All Features pushes RXAACatalogFeatureViewController, which uses
-    menu_catalog.json or the embedded 116-entry fallback.
-11. Tapping Get Code pushes RXAACatalogViewController, which loads
-    index.html into a WKWebView.
-12. Tapping Python Engine shows terminal instructions for mod_menu.py; tapping
-    Telegram opens https://t.me/kun_amra.
+7. Both -raacheatOpen methods call RAACHEATOpenPanel, which requires an active
+   app and presents RXAAMenuViewController inside RXAANavigationController.
+8. The menu loads its two-pane UI: sidebar CATALOG / ALL DATA / TOOLS and a
+   detail pane for the selected category or tool list.
+9. Apply All / Reset All update every actionable catalog switch (72 entries)
+   plus the three legacy demo keys, then show a local confirmation alert.
+10. Get Code pushes RXAACatalogViewController, which loads index.html. Missing
+    or unreadable catalog resources show an error label with install paths.
+11. Full Catalog pushes RXAACatalogFeatureViewController with all 10 categories
+    and 197 entries. The five primary categories also open in the detail pane.
+12. Python Engine shows terminal instructions for mod_menu.py; Telegram opens
+    https://t.me/kun_amra; About shows the UI-only build notice.
 13. Close dismisses the navigation controller, clears gMenuNav, hides the
     full-screen overlay, restores the game key window, and re-shows the button.
 14. UIApplicationDidBecomeActiveNotification, UISceneDidActivateNotification,
     UIWindowDidBecomeKeyNotification, and UIWindowDidBecomeVisibleNotification
     reattach the windows, keep the button visible while the menu is closed, and
     re-key only the full-screen menu while it is open.
+15. UIApplicationWillResignActiveNotification closes an open menu without
+    animation, restores the game window, and hides both Rxaa windows. The next
+    activation re-shows the floating button through the activation observer.
 
 
-PART 1 - TWEAK.X FUNCTIONS
-==========================
+PART 1 - TWEAK.X FUNCTIONS AND CLASSES
+======================================
 
+A. SHARED HELPERS
+-----------------
 1. RAACHEATPassThroughView -hitTest:withEvent:
    Signature: - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event
-   Location: Tweak.x
-   Class:    RAACHEATPassThroughView
-
-   Purpose
-     Keep the full-screen overlay from swallowing touches if it is visible.
-     The floating button now lives in its own 52x52 window, and the full-screen
-     overlay is hidden while the menu is closed. This view remains as a safety
-     fallback and lets the overlay pass through empty touches.
-
-   Parameters
-     point - touch point in the view's coordinate system.
-     event - the UIEvent being dispatched.
-
-   Returns
-     nil when the hit view is the root view itself.
-     The actual subview when the touch lands on the presented menu or another
-     interactive subview.
-
-   Behavior
-     Calls [super hitTest:withEvent:]. If the result is self, returns nil;
-     otherwise returns the subview. This keeps empty overlay areas from
-     swallowing touches while the menu is open.
-
-   Side effects
-     None.
-
-   Notes
-     When the native Rxaa menu is presented as a full-screen modal, the modal
-     has its own opaque view and handles its own touches.
+   Purpose:  keep the full-screen overlay from swallowing touches if it is
+             visible. Returns nil when the hit target would be the view itself.
+   Notes:    the button uses its own window; this is a safety fallback.
 
 2. RXAAGreen
    Signature: static UIColor *RXAAGreen(void)
-   Location: Tweak.x
-
-   Purpose
-     Return the shared accent color used by the title, switches, borders and
-     navigation bar.
-
-   Parameters
-     None.
-
-   Returns
-     UIColor with RGB approximately (0.31, 0.94, 0.65).
-
-   Behavior
-     Creates and returns an autoreleased UIColor.
-
-   Used by
-     RAACHEATInstallOverlay, RXAAMenuViewController, and the icon fallback.
+   Returns:   the accent green used by titles, borders and switches
+              (0.31, 0.94, 0.65).
 
 3. RXAABackground
    Signature: static UIColor *RXAABackground(void)
-   Location: Tweak.x
-
-   Purpose
-     Return the shared dark background color.
-
-   Parameters
-     None.
-
-   Returns
-     UIColor with RGB approximately (0.04, 0.07, 0.10).
-
-   Behavior
-     Creates and returns an autoreleased UIColor.
-
-   Used by
-     The table background and navigation bar appearance.
+   Returns:   black, the native menu background.
 
 4. RAACHEATResourcePath
    Signature: static NSString *RAACHEATResourcePath(NSString *name)
-   Location: Tweak.x
-
-   Purpose
-     Locate a packaged resource in either the rootless or rootful layout.
-
-   Parameters
-     name - resource filename, for example "index.html" or "menu_icon.png".
-
-   Returns
-     The first existing path, or nil if neither location contains the file.
-
-   Search order
-     1. /var/jb/Library/Application Support/RAACHEATMenuDebug/<name>
-     2. /private/var/jb/Library/Application Support/RAACHEATMenuDebug/<name>
-     3. /Library/Application Support/RAACHEATMenuDebug/<name>
-
-   Behavior
-     Builds each path with -stringByAppendingPathComponent: and checks it with
-     NSFileManager -fileExistsAtPath:.
-
-   Side effects
-     Synchronous filesystem existence checks on the calling thread.
-
-   Used by
-     RAACHEATCatalogPath and RAACHEATInstallOverlay.
+   Purpose:  resolve a bundled resource from the installed Application Support
+             directory.
+   Search order:
+     /var/jb/Library/Application Support/RAACHEATMenuDebug
+     /private/var/jb/Library/Application Support/RAACHEATMenuDebug
+     /Library/Application Support/RAACHEATMenuDebug
+   Returns:   the first existing path, otherwise nil. No bundle fallback.
 
 5. RAACHEATCatalogPath
    Signature: static NSString *RAACHEATCatalogPath(void)
-   Location: Tweak.x
+   Purpose:  return the installed index.html path.
+   Returns:   RAACHEATResourcePath(@"index.html"), or nil when the resource is
+             missing. The nil result is handled by RXAACatalogViewController,
+             which shows an in-app error instead of loading a blank page.
 
-   Purpose
-     Return the path to the HTML catalog entry point.
+B. CATALOG DATA LAYER
+---------------------
+6. RXAAEmbeddedFeature / kRXAAEmbeddedFeatures
+   Signature: typedef struct {
+                const char *label;
+                const char *category;
+                const char *kind;
+              } RXAAEmbeddedFeature;
+              static const RXAAEmbeddedFeature kRXAAEmbeddedFeatures[];
+   Purpose:  compile-time fallback copy of the 116 primary feature rows.
+   Contents: 44 aimbot, 49 visuals, 9 memory, 10 settings, 4 help.
+             70 actionable rows and 46 label/help rows. No offsets, xrefs,
+             meta flags, or addresses are embedded.
 
-   Parameters
-     None.
+7. RXAAEmbeddedCatalogFeatures
+   Signature: static NSArray<NSDictionary *> *RXAAEmbeddedCatalogFeatures(void)
+   Purpose:  convert kRXAAEmbeddedFeatures into dictionaries with the same
+             shape used by menu_catalog.json: label, category, kind.
+   Returns:  an array of 116 dictionaries.
 
-   Returns
-     The existing index.html path, or the rootful fallback path if no file was
-     found.
+8. RXAACatalogCategories
+   Signature: static NSArray<NSString *> *RXAACatalogCategories(void)
+   Returns:  the five primary feature categories:
+             @[@"aimbot", @"visuals", @"memory", @"settings", @"help"].
+   Notes:    these categories contain the 116 "feature_entries".
 
-   Behavior
-     Calls RAACHEATResourcePath(@"index.html"). If that returns nil, returns:
-       /Library/Application Support/RAACHEATMenuDebug/index.html
+9. RXAACatalogAllCategories
+   Signature: static NSArray<NSString *> *RXAACatalogAllCategories(void)
+   Returns:  all 10 catalog categories:
+             aimbot, visuals, memory, settings, help, ui, ui-id, runtime,
+             path, format.
+   Notes:    used by Full Catalog and by the all-category cache.
 
-   Notes
-     The fallback path is returned even if it does not exist; WKWebView would
-     then show a blank/error page. The installer does not currently show a
-     missing-resource alert.
+10. RXAACatalogCategoryDisplayName
+    Signature: static NSString *RXAACatalogCategoryDisplayName(NSString *category)
+    Purpose:  map a category identifier to a human-readable title.
+    Returns:  e.g. "Aimbot & Combat", "Cyber ESP & Visuals",
+              "Memory & Movement", "Settings & Config", "Help & Notes",
+              "UI Strings", "UI Identifiers", "Runtime Diagnostics",
+              "Game Paths", "Format Strings". Falls back to a capitalized
+              category string for unknown values.
 
-6. RAACHEATOpenPanel
-   Signature: static void RAACHEATOpenPanel(void)
-   Location: Tweak.x
+11. RXAACatalogLoadItemsInCategories
+    Signature: static NSArray<NSDictionary *> *RXAACatalogLoadItemsInCategories(
+                   NSArray<NSString *> *categories)
+    Purpose:  read menu_catalog.json and filter its items to the requested
+              categories.
+    Behavior:
+      - Resolves menu_catalog.json through RAACHEATResourcePath.
+      - Parses the top-level "items" array with NSJSONSerialization.
+      - Keeps dictionaries with string "category" and "label" fields whose
+        category is in the requested set.
+      - If zero valid items are found, logs the missing path and returns the
+        embedded fallback catalog.
+    Notes:    no game process is contacted.
 
-   Purpose
-     Open the native Rxaa list. The name is historical; this now presents the
-     navigation controller, not the old WebView panel.
+12. RXAACatalogFeatures
+    Signature: static NSArray<NSDictionary *> *RXAACatalogFeatures(void)
+    Purpose:  dispatch_once cache of the five primary categories (116 rows).
+    Returns:  the cached array, or an empty array if construction fails.
 
-   Parameters
-     None.
+13. RXAACatalogAllFeatures
+    Signature: static NSArray<NSDictionary *> *RXAACatalogAllFeatures(void)
+    Purpose:  dispatch_once cache of all 10 categories (197 rows).
+    Returns:  the cached array, or the embedded 116-row fallback if the JSON is
+              unavailable.
 
-   Returns
-     void.
+14. RXAACatalogFilterByCategory
+    Signature: static NSArray<NSDictionary *> *RXAACatalogFilterByCategory(
+                   NSArray<NSDictionary *> *items, NSString *category)
+    Purpose:  return a new array containing only items whose "category" equals
+              the requested value, preserving catalog order.
 
-   Guards
-     - Returns if gOverlayWindow is nil.
-     - Returns if the overlay root has no view controller.
-     - If gMenuNav is already presented, returns.
-     - If gMenuNav is stale (not the presented controller), clears it and
-       continues.
-     - Returns if the overlay root is already presenting another controller.
+15. RXAACatalogFeaturesForCategory
+    Signature: static NSArray<NSDictionary *> *RXAACatalogFeaturesForCategory(
+                   NSString *category)
+    Purpose:  filter the five-category cache.
 
-   Behavior
-     1. Logs "[Rxaa] opening menu".
-     2. Calls RAACHEATRefreshOverlayBounds so the overlay and root view match
-        the current UIWindowScene, then shows the overlay at
-        UIWindowLevelAlert + 100 and hides the small button window before
-        presenting.
-     3. Saves the current app key window in gPreviousKeyWindow via
-        RAACHEATKeyWindowForScene(nil). If no key window is found, uses the
-        first non-overlay, non-button app window.
-     4. Calls [gOverlayWindow makeKeyAndVisible] so presentation/touches work
-        reliably while the menu is open. The button window stays hidden.
-     5. Creates RXAAMenuViewController with UITableViewStyleGrouped.
-     6. Wraps it in a UINavigationController.
-     7. Sets UIModalPresentationFullScreen, a cover-vertical transition,
-        status-bar capture, and the Rxaa background color.
-     8. Presents it from the overlay window's root controller.
-     9. In the presentation completion, clears gMenuNav, hides the overlay,
-        restores the previous key window, and re-shows the button if the
-        navigation controller did not actually become the presented
-        controller.
+16. RXAACatalogAllFeaturesForCategory
+    Signature: static NSArray<NSDictionary *> *RXAACatalogAllFeaturesForCategory(
+                   NSString *category)
+    Purpose:  filter the all-category cache. Used by the menu detail pane and
+              the Full Catalog screen.
 
-   Side effects
-     Sets gMenuNav to the new navigation controller. The controller is
-     dismissed later by -closeMenu, which hides the full-screen overlay,
-     restores the game key window, and shows the button window again.
+17. RXAACatalogFeatureKey
+    Signature: static NSString *RXAACatalogFeatureKey(NSDictionary *item)
+    Purpose:  build the NSUserDefaults key for a catalog switch.
+    Returns:  "rxaa.catalog.<category>.<label>".
+    Notes:    labels are unique within each category in the current catalog, so
+              keys are stable for this build.
 
-   Called by
-     RAACHEATButtonController -raacheatOpen (floating button tap) and
-     RAACHEATRootController -raacheatOpen (four-finger fallback gesture).
+18. RXAACatalogFeatureIsActionable
+    Signature: static BOOL RXAACatalogFeatureIsActionable(NSDictionary *item)
+    Returns:  YES for kind toggle, slider, combo, or config-key; NO for label,
+              help, ui-id, diagnostic, format or path entries.
+    Notes:    UI-only: an actionable row gets a switch, not a game action.
 
-6a. RAACHEATRefreshOverlayBounds
-    Signature: static void RAACHEATRefreshOverlayBounds(void)
-    Location: Tweak.x
+19. RXAACatalogActionableCount
+    Signature: static NSUInteger RXAACatalogActionableCount(
+                   NSArray<NSDictionary *> *items)
+    Returns:  the number of actionable rows in the supplied array (72 for the
+              full catalog, 70 for the five primary categories).
 
-    Purpose
-      Keep the full-screen overlay, its root view, and the separate floating
-      button window matched to the current scene bounds.
+20. RXAASidebarCatalogRows
+    Signature: static NSArray<NSDictionary *> *RXAASidebarCatalogRows(void)
+    Purpose:  build the left sidebar CATALOG rows.
+    Returns:  five dictionaries with key, title and subtitle
+              ("<count> entries"), cached with dispatch_once.
 
-    Behavior
-      - Returns if gOverlayWindow is nil.
-      - Reads gOverlayWindow.windowScene.coordinateSpace.bounds on iOS 13+.
-      - Falls back to [UIScreen mainScreen].bounds.
-      - Sets gOverlayWindow.frame.
-      - Sets the root controller view frame to the window bounds.
-      - Restores the saved button-window center, clamped to the safe area.
-      - Does not change whether the overlay is hidden; the button window remains
-        the only visible Rxaa window while the menu is closed.
+21. RXAAMenuToolRows
+    Signature: static NSArray<NSDictionary *> *RXAAMenuToolRows(void)
+    Purpose:  build the TOOLS & ACTIONS rows used by the menu detail pane.
+    Returns:  seven dictionaries with action, title and subtitle:
+              apply-all, reset-all, get-code, all-features, python, telegram,
+              about. Apply/Reset subtitles include the 72-switch count.
 
-    Called by
-      RAACHEATOpenPanel, before presenting the full-screen menu.
-      RAACHEATRootController -viewWillTransitionToSize:withTransitionCoordinator:.
+C. CONTROLLERS
+--------------
+22. RXAANavigationController -childForStatusBarStyle
+    Signature: - (UIViewController *)childForStatusBarStyle
+    Returns:  self.topViewController.
+    Purpose:  forward the light status-bar style from the visible menu,
+              feature browser or catalog screen.
 
-    Side effects
-      Frame changes only. No game memory or process access.
+23. RXAANavigationController -childForStatusBarHidden
+    Signature: - (UIViewController *)childForStatusBarHidden
+    Returns:  self.topViewController.
+    Purpose:  forward prefersStatusBarHidden = YES so the full-screen menu uses
+              the whole display.
 
-6b. RAACHEATScreenBounds
-    Signature: static CGRect RAACHEATScreenBounds(void)
-    Location: Tweak.x
+24. RAACHEATRootController -loadView
+    Signature: - (void)loadView
+    Purpose:  install a RAACHEATPassThroughView as the overlay root view.
+    Behavior: clear background, full screen bounds.
 
-    Purpose
-      Return the current scene bounds, or the main screen bounds on older apps.
-
-    Returns
-      gOverlayWindow.windowScene.coordinateSpace.bounds when available and
-      non-empty; otherwise [UIScreen mainScreen].bounds.
-
-    Notes
-      Used for button dragging, position restoring, and clamping.
-
-6c. RAACHEATScreenSafeInsets
-    Signature: static UIEdgeInsets RAACHEATScreenSafeInsets(void)
-    Location: Tweak.x
-
-    Purpose
-      Find the safe-area insets of the current game/host window so the floating
-      button can avoid the notch and home indicator.
-
-    Returns
-      The key/host window safeAreaInsets on iOS 11+, or UIEdgeInsetsZero.
-
-    Notes
-      Skips gOverlayWindow and gButtonWindow so Rxaa's own geometry does not
-      define the safe area.
-
-6d. RAACHEATClampFloatButtonCenter
-    Signature: static CGPoint RAACHEATClampFloatButtonCenter(CGPoint center)
-    Location: Tweak.x
-
-    Purpose
-      Keep the 52x52 floating button fully inside the usable screen area.
-
-    Parameters
-      center - proposed button-window center in screen coordinates.
-
-    Returns
-      The clamped center.
-
-    Behavior
-      Applies kRXAAFloatButtonMargin plus the safe-area insets. Falls back to
-      the screen midpoint if the usable area is smaller than the button.
-
-6e. RAACHEATSaveFloatButtonPosition
-    Signature: static void RAACHEATSaveFloatButtonPosition(void)
-    Location: Tweak.x
-
-    Purpose
-      Persist the button position as normalized screen coordinates.
-
-    Behavior
-      Stores x/y fractions in NSUserDefaults under rxaa.float.centerX and
-      rxaa.float.centerY. The values are normalized to the current screen
-      bounds so rotation and different device sizes keep the button in a
-      sensible place.
-
-6f. RAACHEATRestoreFloatButtonPosition
-    Signature: static void RAACHEATRestoreFloatButtonPosition(void)
-    Location: Tweak.x
-
-    Purpose
-      Place the button window at its saved position, or at the default top-right
-      position on first launch.
-
-    Behavior
-      Reads the normalized NSUserDefaults values, converts them to screen
-      coordinates, and clamps them with RAACHEATClampFloatButtonCenter. If no
-      saved value exists, uses the top-right safe-area position.
-
-6g. RAACHEATRestorePreviousKeyWindow
-    Signature: static void RAACHEATRestorePreviousKeyWindow(void)
-    Location: Tweak.x
-
-    Purpose
-      Return input/key ownership to the game after the menu closes or fails to
-      present.
-
-    Behavior
-      - Hides gOverlayWindow and shows gButtonWindow.
-      - Prefers gPreviousKeyWindow if it is still visible.
-      - Otherwise finds a visible non-Rxaa window and makes it key.
-      - If no game window exists, resigns the overlay's key status.
-      - Clears gPreviousKeyWindow.
-
-7. RAACHEATRootController -loadView
-   Signature: - (void)loadView
-   Location: Tweak.x
-   Class:    RAACHEATRootController
-
-   Purpose
-     Build the transparent root view for the overlay window.
-
-   Parameters
-     None.
-
-   Returns
-     void.
-
-   Behavior
-     Creates a RAACHEATPassThroughView with the main screen bounds and sets
-     its background to clear.
-
-   Side effects
-     Replaces self.view.
-
-   Notes
-     This controller is not the menu itself. It presents the Rxaa navigation
-     controller and hosts the fallback gesture target. The floating button is
-     hosted by RAACHEATButtonController in a separate small window.
-
-8. RAACHEATRootController -raacheatOpen
-   Signature: - (void)raacheatOpen
-   Location: Tweak.x
-   Class:    RAACHEATRootController
-
-   Purpose
-     Fallback-gesture target for the full-screen overlay controller.
-
-   Parameters
-     None.
-
-   Returns
-     void.
-
-   Behavior
-     Calls RAACHEATOpenPanel.
-
-   Side effects
-     Presents the full-screen Rxaa menu when the guards in RAACHEATOpenPanel
-     pass. The floating-button tap uses RAACHEATButtonController instead.
-
-8a. RAACHEATRootController -viewWillTransitionToSize:withTransitionCoordinator:
+25. RAACHEATRootController -viewWillTransitionToSize:withTransitionCoordinator:
     Signature: - (void)viewWillTransitionToSize:(CGSize)size
                  withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator
-    Location: Tweak.x
-    Class:    RAACHEATRootController
+    Purpose:  refresh overlay and floating-button bounds before and after a
+              rotation/resize.
 
-    Purpose
-      Refresh the overlay geometry when the scene rotates or resizes.
-
-    Parameters
-      size        - the new view size.
-      coordinator - the transition coordinator for the rotation/resize.
-
-    Returns
-      void.
-
-    Behavior
-      - Calls super.
-      - Calls RAACHEATRefreshOverlayBounds during the transition animation.
-      - Calls it again in the completion block.
-      - The menu remains UIModalPresentationFullScreen.
-
-    Side effects
-      Updates the overlay window, root view, and button-window position.
-
-9. RAACHEATButtonController -loadView
-   Signature: - (void)loadView
-   Location: Tweak.x
-   Class:    RAACHEATButtonController
-
-   Purpose
-     Build the 52x52 root view for the separate button window.
-
-   Behavior
-     Creates a clear UIView with kRXAAFloatButtonSize width/height. The view is
-     transparent and clips to its bounds only when needed.
-
-   Notes
-     This window is the only visible Rxaa window while the menu is closed, so
-     the rest of the screen remains touchable for the game.
-
-9a. RAACHEATButtonController -viewDidLayoutSubviews
-    Signature: - (void)viewDidLayoutSubviews
-    Location: Tweak.x
-    Class:    RAACHEATButtonController
-
-    Purpose
-      Keep the button filling the small button window.
-
-    Behavior
-      Sets gFloatButton.frame to self.view.bounds.
-
-9b. RAACHEATButtonController -raacheatOpen
+26. RAACHEATRootController -raacheatOpen
     Signature: - (void)raacheatOpen
-    Location: Tweak.x
-    Class:    RAACHEATButtonController
+    Purpose:  fallback-gesture entry point; calls RAACHEATOpenPanel.
 
-    Purpose
-      Open the full-screen menu when the floating button is tapped.
-
-    Behavior
-      Calls RAACHEATOpenPanel. The pan recognizer fails for a tap, so a tap
-      opens the menu while a drag moves the button.
-
-9c. RAACHEATButtonController -raacheatPan:
-    Signature: - (void)raacheatPan:(UIPanGestureRecognizer *)pan
-    Location: Tweak.x
-    Class:    RAACHEATButtonController
-
-    Purpose
-      Let the user drag the button window anywhere on screen.
-
-    Parameters
-      pan - the attached UIPanGestureRecognizer.
-
-    Returns
-      void.
-
-    Behavior
-      - On Began: records the window center and the gesture's location in the
-        full-screen overlay's coordinate space; fades the button slightly.
-      - On Changed: computes the new center from the drag delta and clamps it
-        with RAACHEATClampFloatButtonCenter.
-      - On Ended/Cancelled/Failed: clamps again, saves the normalized position
-        with RAACHEATSaveFloatButtonPosition, and restores full opacity.
-      - Uses a tap gesture for opening, so dragging does not accidentally open
-        the menu.
-
-    Side effects
-      Moves gButtonWindow and writes NSUserDefaults rxaa.float.centerX/Y. Does
-      not touch game memory or process state.
-
-9d. RAACHEATRootController -gestureRecognizer:shouldRecognizeSimultaneouslyWithGestureRecognizer:
+27. RAACHEATRootController -gestureRecognizer:shouldRecognizeSimultaneouslyWithGestureRecognizer:
     Signature: - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
                  shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer
-    Location: Tweak.x
-    Class:    RAACHEATRootController
+    Returns:  YES, so the four-finger triple-tap does not block the game's own
+              gestures.
 
-    Purpose
-      Allow the Rxaa fallback open gesture to coexist with the host app's own
-      gesture recognizers.
+28. RAACHEATButtonController -loadView
+    Signature: - (void)loadView
+    Purpose:  create the 52x52 transparent container for the floating button.
 
-    Parameters
-      gestureRecognizer - the Rxaa four-finger triple-tap recognizer.
-      otherGestureRecognizer - the app's gesture recognizer.
+29. RAACHEATButtonController -viewDidLayoutSubviews
+    Signature: - (void)viewDidLayoutSubviews
+    Purpose:  keep gFloatButton filling the button window's root view.
 
-    Returns
-      YES.
+30. RAACHEATButtonController -raacheatOpen
+    Signature: - (void)raacheatOpen
+    Purpose:  button-tap entry point; calls RAACHEATOpenPanel.
 
-    Behavior
-      Returns YES for simultaneous recognition. The recognizer is set as the
-      delegate only for the Rxaa fallback gesture.
+31. RAACHEATButtonController -raacheatPan:
+    Signature: - (void)raacheatPan:(UIPanGestureRecognizer *)pan
+    Purpose:  drag the floating button.
+    Behavior:
+      - Began: remember the window center and touch point; dim the button.
+      - Changed: move the window, clamped by RAACHEATClampFloatButtonCenter.
+      - Ended/Cancelled/Failed: clamp again, save the normalized position,
+        restore opacity.
 
-9b. RAACHEATRestorePreviousKeyWindow
-    Signature: static void RAACHEATRestorePreviousKeyWindow(void)
-    Location: Tweak.x
-
-    Purpose
-      Restore the app's key window after the Rxaa menu closes.
-
-    Parameters
-      None.
-
-    Returns
-      void.
-
-    Behavior
-      If gPreviousKeyWindow exists and is not the overlay window, calls
-      -makeKeyWindow on it. Then clears gPreviousKeyWindow.
-
-9c. RAACHEATKeyWindowForScene
-    Signature: static UIWindow *RAACHEATKeyWindowForScene(UIWindowScene *scene)
-    Location: Tweak.x
-
-    Purpose
-      Find the current key window without using the deprecated
-      UIApplication.keyWindow API, which is treated as an error by the build's
-      deprecation warnings.
-
-    Parameters
-      scene - the preferred UIWindowScene, or nil.
-
-    Returns
-      The first window whose isKeyWindow is YES; otherwise nil.
-
-    Behavior
-      - Checks scene.windows when a scene is provided.
-      - Checks all connected UIWindowScene objects.
-      - Falls back to UIApplication.windows for legacy/older layouts.
-      - The overlay window itself is filtered out by the caller when needed.
-
-10. RXAAFeatureTitles
-    Signature: static NSArray<NSString *> *RXAAFeatureTitles(void)
-    Location: Tweak.x
-
-    Purpose
-      Return the display names of the demo feature rows.
-
-    Parameters
-      None.
-
-    Returns
-      @[@"AimLock", @"ESP", @"Radar"].
-
-    Behavior
-      Creates a new array on each call.
-
-    Used by
-      The table data source for section 0.
-
-11. RXAAFeatureKeys
-    Signature: static NSArray<NSString *> *RXAAFeatureKeys(void)
-    Location: Tweak.x
-
-    Purpose
-      Return the NSUserDefaults keys that store the demo switch states.
-
-    Parameters
-      None.
-
-    Returns
-      @[@"rxaa.aimlock", @"rxaa.esp", @"rxaa.radar"].
-
-    Behavior
-      Creates a new array on each call. The order matches RXAAFeatureTitles.
-
-    Notes
-      These are local app defaults only. They do not affect a game.
-
-12. RXAAMenuViewController -viewDidLoad
+32. RXAAMenuViewController -viewDidLoad
     Signature: - (void)viewDidLoad
-    Location: Tweak.x
-    Class:    RXAAMenuViewController
+    Purpose:  build the two-pane menu.
+    Behavior:
+      - Title "Rxaa", black background, Close button in the navigation bar.
+      - Sidebar UITableView: 3 sections (CATALOG, ALL DATA, TOOLS), 54pt rows,
+        dark selection highlight.
+      - Detail UITableView: category features or the tools/actions list.
+      - 1px divider view between the panes.
+      - Defaults to the first primary category ("aimbot") and catalog mode.
+      - Calls -configureNavigationBar.
 
-    Purpose
-      Configure the native Rxaa list screen.
+33. RXAAMenuViewController -configureNavigationBar
+    Signature: - (void)configureNavigationBar
+    Purpose:  apply the black/green navigation bar appearance on iOS 13+ and set
+              the dark bar style/tint on all supported versions.
 
-    Parameters
-      None.
+34. RXAAMenuViewController -viewWillAppear:
+    Signature: - (void)viewWillAppear:(BOOL)animated
+    Purpose:  re-apply the navigation appearance and reload both tables so
+              switch states changed in a pushed screen are reflected.
 
-    Returns
-      void.
+35. RXAAMenuViewController -viewDidAppear:
+    Signature: - (void)viewDidAppear:(BOOL)animated
+    Purpose:  restore the sidebar selection for the active view.
 
-    Behavior
-      - Sets the title to "Rxaa".
-      - Adds a Close button to the right navigation item.
-      - Sets the table background, separator color, footer view and row height.
-      - On iOS 13+, configures an opaque navigation bar with the Rxaa
-        background and green title.
-      - Sets the navigation bar tint and bar style.
+36. RXAAMenuViewController -viewDidLayoutSubviews
+    Signature: - (void)viewDidLayoutSubviews
+    Purpose:  lay out the sidebar, divider and detail table.
+    Behavior:
+      - Respects left/right safe-area insets (landscape notch).
+      - Sidebar width = clamp(30% of usable width, 132...232).
+      - Applies bottom safe-area insets plus 24pt to both tables.
 
-    Side effects
-      UI configuration only. No game state is touched.
+37. RXAAMenuViewController -selectActiveSidebarRow
+    Signature: - (void)selectActiveSidebarRow
+    Purpose:  highlight either the active category row (section 0) or the Tools
+              & Actions row (section 2, row 0).
 
-    Notes
-      The close button calls -closeMenu on this controller.
-
-13. RXAAMenuViewController -closeMenu
+38. RXAAMenuViewController -closeMenu
     Signature: - (void)closeMenu
-    Location: Tweak.x
-    Class:    RXAAMenuViewController
+    Purpose:  dismiss the navigation controller and restore the game window.
+    Completion: gMenuNav = nil; RAACHEATRestorePreviousKeyWindow (hides the
+              overlay, shows the button, restores the game key window).
 
-    Purpose
-      Dismiss the entire Rxaa navigation controller.
-
-    Parameters
-      None.
-
-    Returns
-      void.
-
-    Behavior
-      Calls -dismissViewControllerAnimated:completion: on the navigation
-      controller, sets gMenuNav = nil, restores the game key window, hides the
-      full-screen overlay, and re-shows the button window in the completion.
-
-    Side effects
-      Removes the menu from the screen, clears the global menu reference, and
-      returns input ownership to the game.
-
-13a. RXAAMenuViewController -viewDidDisappear:
+39. RXAAMenuViewController -viewDidDisappear:
     Signature: - (void)viewDidDisappear:(BOOL)animated
-    Location: Tweak.x
-    Class:    RXAAMenuViewController
+    Purpose:  safety cleanup if the menu is dismissed by an ancestor or by the
+              system rather than by -closeMenu.
+    Behavior: when self or the navigation controller is being dismissed, clears
+              gMenuNav and restores the game window.
 
-    Purpose
-      Clean up if the menu is dismissed by an ancestor or by the system rather
-      than through -closeMenu.
-
-    Behavior
-      Calls super. If self or the navigation controller is being dismissed,
-      clears gMenuNav and calls RAACHEATRestorePreviousKeyWindow. Pushing
-      All Features/Get Code does not trigger this cleanup because the
-      navigation controller is not being dismissed.
-
-    Side effects
-      Same cleanup as -closeMenu: hide overlay, show button, restore game key.
-
-14. RXAAMenuViewController -numberOfSectionsInTableView:
+40. RXAAMenuViewController -numberOfSectionsInTableView:
     Signature: - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
-    Location: Tweak.x
-    Class:    RXAAMenuViewController
+    Returns:  3 for the sidebar; 1 for the detail table.
 
-    Purpose
-      Tell the table there are two sections.
-
-    Parameters
-      tableView - the Rxaa table.
-
-    Returns
-      2.
-
-    Sections
-      0 = FEATURES (AimLock/ESP/Radar switches)
-      1 = TOOLS (Get Code, All Features, Apply All, Reset All, Python Engine,
-          Telegram)
-
-15. RXAAMenuViewController -tableView:numberOfRowsInSection:
+41. RXAAMenuViewController -tableView:numberOfRowsInSection:
     Signature: - (NSInteger)tableView:(UITableView *)tableView
                  numberOfRowsInSection:(NSInteger)section
-    Location: Tweak.x
-    Class:    RXAAMenuViewController
+    Returns:
+      Sidebar section 0: 5 category rows.
+      Sidebar sections 1 and 2: 1 row each.
+      Detail tools mode: RXAAMenuToolRows().count (7).
+      Detail catalog mode: all entries for the active category
+      (RXAACatalogAllFeaturesForCategory).
 
-    Purpose
-      Return the row count for each section.
-
-    Parameters
-      tableView - the Rxaa table.
-      section   - 0 or 1.
-
-    Returns
-      Section 0: RXAAFeatureTitles().count, currently 3.
-      Section 1: 6 (Get Code, All Features, Apply All, Reset All, Python
-      Engine, Telegram).
-
-    Behavior
-      Uses the titles array as the source of truth for the feature count.
-
-16. RXAAMenuViewController -tableView:titleForHeaderInSection:
+42. RXAAMenuViewController -tableView:titleForHeaderInSection:
     Signature: - (NSString *)tableView:(UITableView *)tableView
                  titleForHeaderInSection:(NSInteger)section
-    Location: Tweak.x
-    Class:    RXAAMenuViewController
+    Returns:
+      Sidebar: "CATALOG", "ALL DATA", "TOOLS".
+      Detail: "TOOLS & ACTIONS" or
+      "<CATEGORY NAME>  (<count>)".
 
-    Purpose
-      Supply section headers.
-
-    Parameters
-      tableView - the Rxaa table.
-      section   - 0 or 1.
-
-    Returns
-      "FEATURES" for section 0, "TOOLS" for section 1.
-
-17. RXAAMenuViewController -tableView:titleForFooterInSection:
+43. RXAAMenuViewController -tableView:titleForFooterInSection:
     Signature: - (NSString *)tableView:(UITableView *)tableView
                  titleForFooterInSection:(NSInteger)section
-    Location: Tweak.x
-    Class:    RXAAMenuViewController
-
-    Purpose
-      Explain that the switches are only a UI demo.
-
-    Parameters
-      tableView - the Rxaa table.
-      section   - 0 or 1.
-
-    Returns
-      Section 0:
-        "UI-only demo switches. They save ON/OFF locally and do not hook or
-         modify any game."
-      Section 1:
-        "Rxaa UI Debug Menu | Telegram: @kun_amra
-         Get Code opens the offline catalog. Python Engine provides terminal
-         CLI & config generation. Apply All / Reset All only change demo
-         switch states."
-
-18. RXAAMenuViewController -tableView:cellForRowAtIndexPath:
-    Signature: - (UITableViewCell *)tableView:(UITableView *)tableView
-                 cellForRowAtIndexPath:(NSIndexPath *)indexPath
-    Location: Tweak.x
-    Class:    RXAAMenuViewController
-
-    Purpose
-      Build each row: feature switch rows in section 0, and the Get Code /
-      All Features / Apply All / Reset All / Python Engine / Telegram rows in
-      section 1.
-
-    Parameters
-      tableView - the Rxaa table.
-      indexPath - section and row to build.
-
-    Returns
-      A configured UITableViewCell.
-
-    Section 0 behavior
-      - Reads the feature title and NSUserDefaults key for the row.
-      - Reads the saved boolean.
-      - Sets the subtitle to "ON - UI demo" or "OFF - UI demo".
-      - Creates a UISwitch, sets its tint, tag and initial state.
-      - Adds -toggleChanged: for UIControlEventValueChanged.
-      - Installs the switch as cell.accessoryView.
-      - Disables row selection.
-
-    Section 1 behavior
-      - Row 0: title "Get Code", subtitle "Browse menu names, addresses and
-        ARM64 xrefs", disclosure indicator.
-      - Row 1: dynamic title "All Features (N)" where N is the number of
-        catalog feature entries (currently 116); subtitle "Browse every catalog
-        feature entry"; disclosure indicator.
-      - Row 2: title "Apply All (Demo)", subtitle "Turn all demo switches ON",
-        no accessory.
-      - Row 3: title "Reset All (Demo)", subtitle "Turn all demo switches OFF",
-        no accessory.
-      - Row 4: title "Python Engine (mod_menu.py)", subtitle "CLI & Config
-        Generator in Application Support", disclosure indicator.
-      - Row 5: title "Telegram: @kun_amra", subtitle "Tap to open official
-        Telegram channel", disclosure indicator.
-      - All six rows are selectable.
-
-    Side effects
-      Creates a new UISwitch each time a feature cell is configured.
-
-19. RXAAMenuViewController -toggleChanged:
-    Signature: - (void)toggleChanged:(UISwitch *)sender
-    Location: Tweak.x
-    Class:    RXAAMenuViewController
-
-    Purpose
-      Save the demo switch state and update the visible ON/OFF text.
-
-    Parameters
-      sender - the UISwitch whose value changed. Its tag is the row index.
-
-    Returns
-      void.
-
-    Behavior
-      - Gets RXAAFeatureKeys().
-      - Validates sender.tag against the key count.
-      - Writes sender.isOn to NSUserDefaults under the matching key.
-      - Finds the corresponding cell and updates its detail text to
-        "ON - UI demo" or "OFF - UI demo".
-
-    Side effects
-      NSUserDefaults write. No game memory or process access.
-
-20. RXAAMenuViewController -tableView:didSelectRowAtIndexPath:
-    Signature: - (void)tableView:(UITableView *)tableView
-                 didSelectRowAtIndexPath:(NSIndexPath *)indexPath
-    Location: Tweak.x
-    Class:    RXAAMenuViewController
-
-    Purpose
-      Handle the Get Code, All Features, Apply All, Reset All, Python Engine,
-      and Telegram rows.
-
-    Parameters
-      tableView - the Rxaa table.
-      indexPath - selected row.
-
-    Returns
-      void.
-
-    Behavior
-      - Deselects the row.
-      - If section 1 row 0 was selected, creates RXAACatalogViewController and
-        pushes it onto the navigation stack.
-      - If section 1 row 1 was selected, creates
-        RXAACatalogFeatureViewController and pushes it.
-      - If section 1 row 2 was selected, calls -setAllDemoSwitches:YES.
-      - If section 1 row 3 was selected, calls -setAllDemoSwitches:NO.
-      - If section 1 row 4 was selected, presents a UIAlertController that
-        explains how to run mod_menu.py through `rxa-menu` in a terminal.
-      - If section 1 row 5 was selected, opens https://t.me/kun_amra with
-        UIApplication openURL:options:completionHandler:.
-
-    Side effects
-      Navigation push, demo NSUserDefaults writes, an alert presentation, or
-      opening the Telegram URL.
-
-20a. RXAAMenuViewController -setAllDemoSwitches:
-    Signature: - (void)setAllDemoSwitches:(BOOL)on
-    Location: Tweak.x
-    Class:    RXAAMenuViewController
-
-    Purpose
-      Turn all demo switches ON or OFF at once, including actionable catalog
-      entries.
-
-    Parameters
-      on - YES for Apply All, NO for Reset All.
-
-    Returns
-      void.
-
-    Behavior
-      - Iterates RXAAFeatureKeys() and writes the boolean.
-      - Iterates RXAACatalogFeatures(); for every actionable catalog entry,
-        writes the same boolean under RXAACatalogFeatureKey(item).
-      - Reloads main-menu section 0 without animation so the switch states and
-        ON/OFF subtitles refresh.
-
-    Side effects
-      NSUserDefaults writes and a table section reload. No game memory or
-      process access.
-
-21. RXAAMenuViewController -preferredStatusBarStyle
-    Signature: - (UIStatusBarStyle)preferredStatusBarStyle
-    Location: Tweak.x
-    Class:    RXAAMenuViewController
-
-    Purpose
-      Request a light status bar for the dark menu.
-
-    Parameters
-      None.
-
-    Returns
-      UIStatusBarStyleLightContent.
-
-    Related method
-      -prefersStatusBarHidden returns YES. The menu is presented full screen
-      with nav.modalPresentationCapturesStatusBarAppearance = YES.
-
-22. RXAACatalogViewController -viewDidLoad
-    Signature: - (void)viewDidLoad
-    Location: Tweak.x
-    Class:    RXAACatalogViewController
-
-    Purpose
-      Create the WebView that shows the offline catalog.
-
-    Parameters
-      None.
-
-    Returns
-      void.
-
-    Behavior
-      - Sets the title to "Get Code".
-      - Sets a black background.
-      - Adds a Close button to the navigation item.
-      - Creates a WKWebView, sets autoresizing, transparency and scroll color.
-      - Adds the WebView to the view.
-      - Resolves RAACHEATCatalogPath() and calls
-        -loadFileURL:allowingReadAccessToURL: on the parent directory.
-
-    Side effects
-      Loads local HTML. No network request is made by this code.
-
-    Notes
-      If index.html is missing, the WebView may be blank. There is no explicit
-      error label.
-
-23. RXAACatalogViewController -viewDidLayoutSubviews
-    Signature: - (void)viewDidLayoutSubviews
-    Location: Tweak.x
-    Class:    RXAACatalogViewController
-
-    Purpose
-      Keep the WebView filling the controller's view.
-
-    Parameters
-      None.
-
-    Returns
-      void.
-
-    Behavior
-      Sets self.webView.frame = self.view.bounds after calling super.
-
-24. RXAACatalogViewController -closeMenu
-    Signature: - (void)closeMenu
-    Location: Tweak.x
-    Class:    RXAACatalogViewController
-
-    Purpose
-      Dismiss the entire Rxaa navigation controller from the catalog screen.
-
-    Parameters
-      None.
-
-    Returns
-      void.
-
-    Behavior
-      Calls -dismissViewControllerAnimated:completion: on the navigation
-      controller, sets gMenuNav = nil, restores the game key window, hides the
-      full-screen overlay, and re-shows the button window in the completion.
-
-25. RXAACatalogViewController -preferredStatusBarStyle
-    Signature: - (UIStatusBarStyle)preferredStatusBarStyle
-    Location: Tweak.x
-    Class:    RXAACatalogViewController
-
-    Purpose
-      Request a light status bar for the black catalog screen.
-
-    Parameters
-      None.
-
-    Returns
-      UIStatusBarStyleLightContent.
-
-    Related method
-      -prefersStatusBarHidden returns YES so the full-screen catalog uses the
-      whole display.
-
-26. RAACHEATInstallOverlay
-    Signature: static void RAACHEATInstallOverlay(void)
-    Location: Tweak.x
-
-    Purpose
-      Create the overlay window, floating icon, button behavior, and fallback
-      activation gesture.
-
-    Parameters
-      None.
-
-    Returns
-      void.
-
-    Guards
-      - Returns if gOverlayWindow already exists.
-      - Increments gInstallAttempts; returns after more than 40 attempts.
-      - Returns if [UIApplication sharedApplication] is nil.
-
-    Window selection
-      - On iOS 13+, calls RAACHEATActiveWindowScene.
-      - If a scene exists, creates the full-screen overlay with
-        initWithWindowScene and the separate button window with
-        initWithWindowScene.
-      - If no scene exists but app.windows is non-empty, uses the legacy
-        UIWindow initWithFrame fallback for the overlay and the button window
-        (older apps that do not adopt UIScene).
-      - If there is no scene and no app window yet, returns and retries.
-      - On iOS 12 and older, creates frame-based UIWindows.
-
-    Behavior
-      - Sets the full-screen overlay to UIWindowLevelAlert + 100 and initially
-        hides it (hidden = YES), so it cannot block game touches while closed.
-      - Makes the overlay transparent.
-      - Installs RAACHEATRootController and sets the root view frame.
-      - Creates a separate 52x52 UIWindow at UIWindowLevelAlert + 101 for the
-        floating button.
-      - Creates RAACHEATButtonController as the button window's root.
-      - Creates the 52x52 button and applies corner radius, border, clipping and
-        accessibility label "Rxaa".
-      - Loads menu_icon.png, then menu_image.jpg, as a background image.
-      - Falls back to the letter "R" if no icon exists.
-      - Adds a UIPanGestureRecognizer for -raacheatPan:.
-      - Adds a single-tap gesture for -raacheatOpen. A drag does not open the
-        menu; a tap does.
-      - Restores the saved button-window position.
-      - Calls RAACHEATInstallOpenGesture on the game host window.
-      - Logs "[Rxaa] overlay installed ..." for diagnostics.
-
-    Side effects
-      Creates two UIWindows, a UIButton, and gesture recognizers in the current
-      app process. No game process is modified. The full-screen menu window is
-      hidden; only the 52x52 button window is visible until the menu opens.
-
-27. RAACHEATTryInstall
-    Signature: static void RAACHEATTryInstall(void)
-    Location: Tweak.x
-
-    Purpose
-      Retry overlay installation when UIApplication or UIWindowScene is not
-      ready yet, and reattach an existing overlay to the active scene.
-
-    Parameters
-      None.
-
-    Returns
-      void.
-
-    Behavior
-      - If gOverlayWindow exists, calls RAACHEATAttachWindowToScene.
-      - If the window still has no UIWindowScene, schedules another attempt
-        (up to the 41-attempt cap). This handles legacy windows that gain a
-        scene late.
-      - Calls RAACHEATInstallOverlay when no window exists.
-      - If the window still does not exist, schedules itself again after
-        1.5 seconds on the main queue.
-
-    Side effects
-      Repeated UI attempts until success or the 41-attempt cap.
-
-28. %ctor (Logos constructor)
-    Signature: %ctor { ... }
-    Location: Tweak.x
-
-    Purpose
-      Tweak entry point. Runs when the dylib is loaded into a process.
-
-    Parameters
-      None.
-
-    Returns
-      Nothing (constructor).
-
-    Behavior
-      Creates an autorelease pool, calls RAACHEATObserveLifecycle, and schedules
-      RAACHEATTryInstall after 1.5 seconds on the main queue.
-
-    Notes
-      The delay gives UIApplication time to create its window/scene. In
-      processes without UIApplication, RAACHEATTryInstall eventually stops
-      after the attempt cap.
-
-29. RAACHEATActiveWindowScene
-    Signature: static UIWindowScene *RAACHEATActiveWindowScene(void)
-    Location: Tweak.x
-
-    Purpose
-      Find the best UIWindowScene for the overlay.
-
-    Parameters
-      None.
-
-    Returns
-      A foreground-active UIWindowScene when possible; otherwise a connected
-      non-unattached scene; otherwise the scene of an existing app window; or
-      nil.
-
-    Behavior
-      Iterates [UIApplication sharedApplication].connectedScenes, then scans
-      app.windows for a windowScene. The function is guarded by @available for
-      iOS 13+.
-
-30. RAACHEATHostWindow
-    Signature: static UIWindow *RAACHEATHostWindow(UIWindowScene *scene)
-    Location: Tweak.x
-
-    Purpose
-      Find the app window that should own the fallback four-finger gesture.
-
-    Parameters
-      scene - the active UIWindowScene, or nil.
-
-    Returns
-      The app key window, a visible scene window, or a fallback window. The
-      overlay window itself is skipped.
-
-    Behavior
-      Checks RAACHEATKeyWindowForScene first, then scene.windows, then
-      app.windows. This prevents installing the gesture on the transparent
-      overlay window.
-
-31. RAACHEATInstallOpenGesture
-    Signature: static void RAACHEATInstallOpenGesture(RAACHEATRootController *root, UIWindowScene *scene)
-    Location: Tweak.x
-
-    Purpose
-      Install a hidden fallback way to open Rxaa when the floating button is not
-      reachable.
-
-    Parameters
-      root  - the overlay root controller, used as the gesture target.
-      scene - the active UIWindowScene, or nil.
-
-    Returns
-      void.
-
-    Behavior
-      - Finds the host window with RAACHEATHostWindow.
-      - Removes an old recognizer if the host changed or the recognizer was
-        removed by the app.
-      - Creates a UITapGestureRecognizer with 4 touches and 3 taps.
-      - Sets cancelsTouchesInView = NO so normal app touches still work.
-      - Sets the root controller as delegate and allows simultaneous
-        recognition.
-      - Adds the recognizer to the host window.
-      - Logs "[Rxaa] fallback gesture installed ...".
-
-    Notes
-      This is a UI-only activation path. It does not hook game input.
-
-32. RAACHEATAttachWindowToScene
-    Signature: static void RAACHEATAttachWindowToScene(void)
-    Location: Tweak.x
-
-    Purpose
-      Reattach both Rxaa windows to the current active scene and refresh their
-      frame/gesture/visibility after app activation.
-
-    Parameters
-      None.
-
-    Returns
-      void.
-
-    Behavior
-      - Returns if gOverlayWindow is nil.
-      - On iOS 13+, gets RAACHEATActiveWindowScene.
-      - Sets gOverlayWindow.windowScene and gButtonWindow.windowScene if they
-        changed.
-      - Updates gOverlayWindow.frame from scene.coordinateSpace.bounds.
-      - Updates the root view frame.
-      - Reinstalls the fallback gesture.
-      - Keeps the full-screen overlay at UIWindowLevelAlert + 100 and the button
-        window at UIWindowLevelAlert + 101.
-      - If gMenuNav is non-nil: shows the overlay and hides the button window.
-      - If gMenuNav is nil: hides the overlay, shows the button window, and
-        restores/clamps the saved button position.
-
-32a. RAACHEATEnsureOverlayVisible
-     Signature: static void RAACHEATEnsureOverlayVisible(void)
-     Location: Tweak.x
-
-     Purpose
-       Keep Rxaa usable after the game changes windows, enters a match, returns
-       to the foreground, or switches scenes, without blocking game input.
-
-     Behavior
-       - Returns if gOverlayWindow is nil.
-       - Calls RAACHEATAttachWindowToScene.
-       - If gMenuNav is non-nil (menu open): shows the overlay, hides the button
-         window, and calls makeKeyAndVisible so menu input stays active.
-       - If gMenuNav is nil (menu closed): hides the full-screen overlay and
-         shows only the small button window, so the game remains clickable
-         outside the button.
-       - Does not steal key status or log a re-show message while the menu is
-         closed.
-
-     Side effects
-       Window visibility/level changes and scene reattachment. No game process
-       access.
-
-33. RAACHEATObserveLifecycle
-    Signature: static void RAACHEATObserveLifecycle(void)
-    Location: Tweak.x
-
-    Purpose
-      Keep the overlay alive when the app becomes active, a scene activates, or
-      another window becomes key/visible (for example when a game joins a match
-      and swaps windows).
-
-    Parameters
-      None.
-
-    Returns
-      void.
-
-    Behavior
-      Uses dispatch_once to register:
-      - UIApplicationDidBecomeActiveNotification
-      - UISceneDidActivateNotification (iOS 13+)
-      - UIWindowDidBecomeKeyNotification
-      - UIWindowDidBecomeVisibleNotification
-      - UIDeviceOrientationDidChangeNotification
-      Activation/scene handlers reset gInstallAttempts, then either call
-      RAACHEATEnsureOverlayVisible for an existing window or call
-      RAACHEATTryInstall. Key/visible handlers ignore Rxaa's own two windows.
-
-    Notes
-      When the menu is closed, the observers keep only the small button window
-      visible and hide the full-screen overlay; this preserves game clicks.
-      When the menu is open, they re-key the full-screen overlay. They do not
-      inspect or modify game data.
-
-
-PART 1B - CATALOG-DRIVEN FEATURE BROWSER
-========================================
-These functions/classes load menu_catalog.json and build the "All Features"
-screen. The JSON is read from the installed resource directory, filtered to the
-five feature categories, and displayed as grouped UI-only rows. If the JSON is
-missing, malformed, or empty, an embedded 116-entry feature table is used
-instead, so All Features is not empty in a sandboxed/unreadable-resource case.
-No game process is contacted.
-
-1. RXAACatalogCategories
-   Signature: static NSArray<NSString *> *RXAACatalogCategories(void)
-   Location: Tweak.x
-
-   Purpose
-     Define the category order used by the All Features screen.
-
-   Returns
-     @[@"aimbot", @"visuals", @"memory", @"settings", @"help"].
-
-   Notes
-     These are the categories counted as feature_entries in build_info.json
-     (116 total).
-
-2. RXAACatalogFeatures
-   Signature: static NSArray<NSDictionary *> *RXAACatalogFeatures(void)
-   Location: Tweak.x
-
-   Purpose
-     Load and cache the feature entries from menu_catalog.json.
-
-   Behavior
-     - Finds menu_catalog.json through RAACHEATResourcePath.
-     - Reads it with NSData and NSJSONSerialization.
-     - Reads the top-level "items" array.
-     - Keeps dictionaries whose "category" is in RXAACatalogCategories.
-     - Requires string values for "category" and "label".
-     - If zero features were loaded, logs the missing path and calls
-       RXAAEmbeddedCatalogFeatures for the built-in 116-entry fallback.
-     - Caches the filtered/fallback array with dispatch_once.
-
-   Returns
-     The cached feature array. For this build it contains 116 entries even if
-     the external JSON cannot be read.
-
-   Notes
-     The screen displays all 116 feature entries: 70 actionable entries
-     (config-key/toggle/slider/combo) and 46 read-only label/help entries.
-
-2a. RXAAEmbeddedFeature / kRXAAEmbeddedFeatures
-    Signature: typedef struct {
-                 const char *label;
-                 const char *category;
-                 const char *kind;
-               } RXAAEmbeddedFeature;
-               static const RXAAEmbeddedFeature kRXAAEmbeddedFeatures[];
-    Location: Tweak.x
-
-    Purpose
-      Compile-time copy of the 116 feature labels/categories/kinds used when
-      menu_catalog.json is unavailable.
-
-    Contents
-      - 116 rows: 44 aimbot, 49 visuals, 9 memory, 10 settings, 4 help.
-      - 70 actionable rows and 46 label/help rows.
-      - Only the fields used by the All Features UI are stored; no offsets,
-        xrefs, meta flags, or memory addresses are embedded.
-
-    Notes
-      The table is generated from the same menu_catalog.json feature set. It is
-      intentionally data-only and contains no game code.
-
-2b. RXAAEmbeddedCatalogFeatures
-    Signature: static NSArray<NSDictionary *> *RXAAEmbeddedCatalogFeatures(void)
-    Location: Tweak.x
-
-    Purpose
-      Convert kRXAAEmbeddedFeatures into the same dictionary shape used by
-      RXAACatalogFeatures.
-
-    Behavior
-      - Computes the array count at compile time.
-      - Creates an NSMutableArray with that capacity.
-      - For each row, adds:
-          @{ @"label": ..., @"category": ..., @"kind": ... }.
-      - Returns the mutable array.
-
-    Returns
-      An array of 116 feature dictionaries.
-
-    Used by
-      RXAACatalogFeatures when the external JSON yields zero features.
-
-3. RXAACatalogFeaturesForCategory
-   Signature: static NSArray<NSDictionary *> *RXAACatalogFeaturesForCategory(NSString *category)
-   Location: Tweak.x
-
-   Purpose
-     Filter the cached feature list for one category.
-
-   Parameters
-     category - aimbot, visuals, memory, settings, or help.
-
-   Returns
-     A new array containing matching feature dictionaries, in catalog order.
-
-4. RXAACatalogFeatureKey
-   Signature: static NSString *RXAACatalogFeatureKey(NSDictionary *item)
-   Location: Tweak.x
-
-   Purpose
-     Build the NSUserDefaults key for one feature switch.
-
-   Parameters
-     item - one feature dictionary from menu_catalog.json.
-
-   Returns
-     "rxaa.catalog.<category>.<label>".
-
-   Notes
-     Labels are unique in the current 116-entry feature set, so this key is
-     stable for this catalog build.
-
-5. RXAACatalogFeatureIsActionable
-   Signature: static BOOL RXAACatalogFeatureIsActionable(NSDictionary *item)
-   Location: Tweak.x
-
-   Purpose
-     Decide whether a feature row gets a demo switch.
-
-   Parameters
-     item - one feature dictionary.
-
-   Returns
-     YES for kind toggle, slider, combo, or config-key; NO for label and help
-     entries.
-
-   Notes
-     This keeps headings/descriptions readable while exposing every actionable
-     catalog key as an ON/OFF demo switch.
-
-6. RXAACatalogSwitch
-   Signature: @interface RXAACatalogSwitch : UISwitch
-              @property (nonatomic, copy) NSString *featureKey;
-              @end
-   Location: Tweak.x
-
-   Purpose
-     A UISwitch that carries the NSUserDefaults key for its catalog row.
-
-   Behavior
-     - Inherits all UISwitch behavior.
-     - featureKey is set when the cell is configured.
-     - -catalogSwitchChanged: reads featureKey instead of relying on a row tag.
-
-7. RXAACatalogFeatureViewController -viewDidLoad
-   Signature: - (void)viewDidLoad
-   Location: Tweak.x
-   Class:    RXAACatalogFeatureViewController
-
-   Purpose
-     Configure the All Features table.
-
-   Behavior
-     - Sets the navigation title to "All Features".
-     - Sets the Rxaa background color.
-     - Sets a dark separator color.
-     - Clears the empty table footer and sets a 58-point row height.
-
-8. RXAACatalogFeatureViewController -numberOfSectionsInTableView:
-   Signature: - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
-   Location: Tweak.x
-   Class:    RXAACatalogFeatureViewController
-
-   Purpose
-     Return one section per feature category.
-
-   Returns
-     RXAACatalogCategories().count, currently 5.
-
-9. RXAACatalogFeatureViewController -tableView:numberOfRowsInSection:
-   Signature: - (NSInteger)tableView:(UITableView *)tableView
-                numberOfRowsInSection:(NSInteger)section
-   Location: Tweak.x
-   Class:    RXAACatalogFeatureViewController
-
-   Purpose
-     Return the number of feature entries in a category.
-
-   Parameters
-     tableView - the All Features table.
-     section   - 0..4.
-
-   Returns
-     RXAACatalogFeaturesForCategory(category).count, or 0 for an invalid
-     section.
-
-10. RXAACatalogFeatureViewController -tableView:titleForHeaderInSection:
-    Signature: - (NSString *)tableView:(UITableView *)tableView
-                 titleForHeaderInSection:(NSInteger)section
-    Location: Tweak.x
-    Class:    RXAACatalogFeatureViewController
-
-    Purpose
-      Show the uppercase category name as the section header.
-
-    Returns
-      AIMBOT, VISUALS, MEMORY, SETTINGS, or HELP; nil for an invalid section.
-
-11. RXAACatalogFeatureViewController -tableView:titleForFooterInSection:
-    Signature: - (NSString *)tableView:(UITableView *)tableView
-                 titleForFooterInSection:(NSInteger)section
-    Location: Tweak.x
-    Class:    RXAACatalogFeatureViewController
-
-    Purpose
-      Explain that the All Features switches are UI-only.
-
-    Returns
-      Section 0: "UI-only demo entries. Switches save locally; no game hooks
-      or memory access."
+    Returns:
+      Sidebar TOOLS section: the UI-only build note.
+      Tools detail: "Demo actions only..." note.
+      Catalog detail: "Catalog reference rows..." note.
       Other sections: nil.
 
-12. RXAACatalogFeatureViewController -tableView:cellForRowAtIndexPath:
+43a. RXAAMenuViewController -tableView:willDisplayHeaderView:forSection:
+    Signature: - (void)tableView:(UITableView *)tableView
+                 willDisplayHeaderView:(UIView *)view forSection:(NSInteger)section
+    Purpose:  style section headers.
+    Behavior: sidebar headers use a 9pt monospaced muted label on the sidebar
+              background; detail headers use a 10pt monospaced green label on
+              black.
+
+44. RXAAMenuViewController -tableView:cellForRowAtIndexPath:
     Signature: - (UITableViewCell *)tableView:(UITableView *)tableView
                  cellForRowAtIndexPath:(NSIndexPath *)indexPath
-    Location: Tweak.x
-    Class:    RXAACatalogFeatureViewController
+    Purpose:  route sidebar rows to -sidebarCellForRowAtIndexPath: and detail
+              rows to -detailCellForRowAtIndexPath:.
 
-    Purpose
-      Build one feature row from menu_catalog.json.
+45. RXAAMenuViewController -sidebarCellForRowAtIndexPath:
+    Signature: - (UITableViewCell *)sidebarCellForRowAtIndexPath:(NSIndexPath *)indexPath
+    Behavior:
+      - Section 0: category title plus "N entries" subtitle.
+      - Section 1: "Full Catalog" plus total entry count; disclosure indicator.
+      - Section 2: "Tools & Actions" plus action summary.
+      - Reuses a subtitle cell and a dark green selected background.
 
-    Parameters
-      tableView - the All Features table.
-      indexPath - section/category and row.
+46. RXAAMenuViewController -detailCellForRowAtIndexPath:
+    Signature: - (UITableViewCell *)detailCellForRowAtIndexPath:(NSIndexPath *)indexPath
+    Behavior:
+      - Tools mode: title/subtitle from RXAAMenuToolRows; disclosure indicator
+        for push actions; no accessory for Apply/Reset.
+      - Catalog mode: label plus "<kind> | <va>" subtitle.
+      - Actionable rows get RXAACatalogSwitch with saved state and
+        -catalogSwitchChanged:; read-only rows disable selection.
 
-    Returns
-      A configured subtitle cell.
-
-    Behavior
-      - Looks up the category and feature dictionary.
-      - Sets the label as the title.
-      - Sets the subtitle to "<category> - <kind> - UI demo" or
-        "<category> - <kind> - catalog entry".
-      - For actionable entries, creates RXAACatalogSwitch, restores its saved
-        ON/OFF value, sets featureKey, and adds -catalogSwitchChanged:.
-      - For label/help entries, shows no switch and no selection.
-      - Adjusts long labels to fit the row width.
-
-13. RXAACatalogFeatureViewController -catalogSwitchChanged:
+47. RXAAMenuViewController -catalogSwitchChanged:
     Signature: - (void)catalogSwitchChanged:(UISwitch *)sender
-    Location: Tweak.x
-    Class:    RXAACatalogFeatureViewController
+    Purpose:  persist one catalog switch.
+    Behavior: verifies RXAACatalogSwitch and featureKey, then writes isOn to
+              NSUserDefaults. No game state is touched.
 
-    Purpose
-      Save the demo state of one catalog feature switch.
+48. RXAAMenuViewController -setAllDemoSwitches:
+    Signature: - (NSUInteger)setAllDemoSwitches:(BOOL)on
+    Purpose:  Apply All / Reset All.
+    Behavior:
+      - Writes the three legacy keys (rxaa.aimlock, rxaa.esp, rxaa.radar).
+      - Iterates RXAACatalogAllFeatures(); for every actionable entry writes
+        the boolean under RXAACatalogFeatureKey.
+      - Synchronizes defaults, reloads both tables, restores the sidebar
+        selection, and returns the number of catalog switches updated (72).
 
-    Parameters
-      sender - the RXAACatalogSwitch that changed.
+49. RXAAMenuViewController -showDemoActionAlert:count:
+    Signature: - (void)showDemoActionAlert:(BOOL)on count:(NSUInteger)count
+    Purpose:  show the local-only confirmation after Apply All / Reset All.
+    Message: "<count> local catalog switches were turned ON/OFF. This only
+              writes NSUserDefaults. No game process is contacted."
 
-    Behavior
-      - Verifies the sender is an RXAACatalogSwitch.
-      - Reads its featureKey.
-      - Writes sender.isOn to NSUserDefaults under that key.
+50. RXAAMenuViewController -showFeatureDetails:
+    Signature: - (void)showFeatureDetails:(NSDictionary *)item
+    Purpose:  show an alert with category, kind, string VA, first xref and
+              sorted metadata for a tapped catalog row.
 
-    Side effects
-      NSUserDefaults write only. No game memory or process access.
+51. RXAAMenuViewController -showPythonEngineInfo
+    Signature: - (void)showPythonEngineInfo
+    Purpose:  explain how to run the bundled mod_menu.py through rxa-menu in
+              NewTerm/SSH. States that it is local config generation only.
 
-14. RXAACatalogFeatureViewController -preferredStatusBarStyle
+52. RXAAMenuViewController -showAbout
+    Signature: - (void)showAbout
+    Purpose:  show the Rxaa 1.3.0 UI-only notice and the explicit statement that
+              ros.dylib is not loaded, hooked, or signed into a game.
+
+53. RXAAMenuViewController -handleToolAction:
+    Signature: - (void)handleToolAction:(NSString *)action
+    Actions:
+      apply-all    -> setAllDemoSwitches:YES, then confirmation alert.
+      reset-all    -> setAllDemoSwitches:NO, then confirmation alert.
+      get-code     -> push RXAACatalogViewController.
+      all-features -> push RXAACatalogFeatureViewController with
+                      showsAllCategories = YES.
+      python       -> showPythonEngineInfo.
+      telegram     -> open https://t.me/kun_amra; a failed open presents an
+                      alert with the URL.
+      about        -> showAbout.
+
+54. RXAAMenuViewController -tableView:didSelectRowAtIndexPath:
+    Signature: - (void)tableView:(UITableView *)tableView
+                 didSelectRowAtIndexPath:(NSIndexPath *)indexPath
+    Behavior:
+      - Sidebar section 0: switch activeCategory, set catalog mode, reload the
+        detail table, scroll to top, restore selection.
+      - Sidebar section 1: push Full Catalog (all 10 categories).
+      - Sidebar section 2: set tools mode, reload detail, restore selection.
+      - Detail tools: dispatch the selected tool action.
+      - Detail catalog: show feature details.
+
+55. RXAAMenuViewController -prefersStatusBarHidden
+    Signature: - (BOOL)prefersStatusBarHidden
+    Returns:  YES.
+
+56. RXAAMenuViewController -preferredStatusBarStyle
     Signature: - (UIStatusBarStyle)preferredStatusBarStyle
-    Location: Tweak.x
-    Class:    RXAACatalogFeatureViewController
+    Returns:  UIStatusBarStyleLightContent; forwarded by
+              RXAANavigationController.
 
-    Purpose
-      Request a light status bar for the dark feature list.
+57. RXAACatalogSwitch
+    Signature: @interface RXAACatalogSwitch : UISwitch
+               @property (nonatomic, copy) NSString *featureKey;
+               @end
+    Purpose:  UISwitch that carries the NSUserDefaults key for its row, so cell
+              reuse cannot mix up switch state.
 
-    Returns
-      UIStatusBarStyleLightContent.
+58. RXAACatalogFeatureViewController -viewDidLoad
+    Signature: - (void)viewDidLoad
+    Purpose:  configure the All Features / Full Catalog grouped table.
+    Behavior:
+      - Chooses five primary categories or all 10 based on showsAllCategories.
+      - Drops categories with zero rows (important for the embedded fallback,
+        which only contains the five primary categories).
+      - Sets title "All Features (116)" or "Full Catalog (197)".
+      - Sets black background, dark separators, 60pt rows.
 
-    Related method
-      -prefersStatusBarHidden returns YES so the full-screen feature list uses
-      the whole display.
+59. RXAACatalogFeatureViewController -viewWillAppear:
+    Signature: - (void)viewWillAppear:(BOOL)animated
+    Purpose:  reload the table so switches changed elsewhere are refreshed.
+
+60. RXAACatalogFeatureViewController -catalogCategories
+    Signature: - (NSArray<NSString *> *)catalogCategories
+    Returns:  visibleCategories when set; otherwise the five/all category list.
+
+61. RXAACatalogFeatureViewController -featuresForCategory:
+    Signature: - (NSArray<NSDictionary *> *)featuresForCategory:(NSString *)category
+    Returns:  five-category or all-category entries for the requested category.
+
+62. RXAACatalogFeatureViewController -numberOfSectionsInTableView:
+    Signature: - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
+    Returns:  number of visible categories (5 or 10).
+
+63. RXAACatalogFeatureViewController -tableView:numberOfRowsInSection:
+    Signature: - (NSInteger)tableView:(UITableView *)tableView
+                 numberOfRowsInSection:(NSInteger)section
+    Returns:  featuresForCategory(category).count, or 0 for an invalid section.
+
+64. RXAACatalogFeatureViewController -tableView:titleForHeaderInSection:
+    Signature: - (NSString *)tableView:(UITableView *)tableView
+                 titleForHeaderInSection:(NSInteger)section
+    Returns:  the uppercase display name for the category, or nil.
+
+65. RXAACatalogFeatureViewController -tableView:titleForFooterInSection:
+    Signature: - (NSString *)tableView:(UITableView *)tableView
+                 titleForFooterInSection:(NSInteger)section
+    Returns:  the UI-only note for section 0; nil otherwise.
+
+65a. RXAACatalogFeatureViewController -tableView:willDisplayHeaderView:forSection:
+    Signature: - (void)tableView:(UITableView *)tableView
+                 willDisplayHeaderView:(UIView *)view forSection:(NSInteger)section
+    Purpose:  style category headers with a green 10pt monospaced label on the
+              black catalog background.
+
+66. RXAACatalogFeatureViewController -tableView:cellForRowAtIndexPath:
+    Signature: - (UITableViewCell *)tableView:(UITableView *)tableView
+                 cellForRowAtIndexPath:(NSIndexPath *)indexPath
+    Behavior:
+      - Builds a subtitle cell from label/category/kind/va.
+      - Actionable rows get a RXAACatalogSwitch keyed by
+        RXAACatalogFeatureKey and restored from NSUserDefaults.
+      - Read-only rows show "<category> - <kind> - catalog entry" and no switch.
+      - Long labels shrink to fit.
+
+67. RXAACatalogFeatureViewController -catalogSwitchChanged:
+    Signature: - (void)catalogSwitchChanged:(UISwitch *)sender
+    Purpose:  persist the switch state under featureKey.
+
+68. RXAACatalogFeatureViewController -prefersStatusBarHidden
+    Signature: - (BOOL)prefersStatusBarHidden
+    Returns:  YES.
+
+69. RXAACatalogFeatureViewController -preferredStatusBarStyle
+    Signature: - (UIStatusBarStyle)preferredStatusBarStyle
+    Returns:  UIStatusBarStyleLightContent.
+
+70. RXAACatalogViewController -viewDidLoad
+    Signature: - (void)viewDidLoad
+    Purpose:  create the offline catalog WebView and resource error UI.
+    Behavior:
+      - Title "Offline Catalog", black background, Close button.
+      - Creates WKWebView with black background and self as navigation delegate.
+      - Creates a multiline monospaced error label, initially hidden.
+      - Resolves RAACHEATCatalogPath. If nil, shows an error with the rootless
+        and rootful install paths and returns.
+      - Otherwise loads the file URL with read access limited to its directory.
+
+71. RXAACatalogViewController -showCatalogError:
+    Signature: - (void)showCatalogError:(NSString *)message
+    Purpose:  hide the WebView, display the error label, bring it to front and
+              log the message.
+
+72. RXAACatalogViewController -viewDidLayoutSubviews
+    Signature: - (void)viewDidLayoutSubviews
+    Purpose:  fill the view with the WebView and inset the error label by the
+              safe area plus 24pt.
+
+73. RXAACatalogViewController -webView:didFinishNavigation:
+    Signature: - (void)webView:(WKWebView *)webView
+                 didFinishNavigation:(WKNavigation *)navigation
+    Purpose:  clear any prior error and show the loaded catalog.
+
+74. RXAACatalogViewController -webView:didFailProvisionalNavigation:withError:
+    Signature: - (void)webView:(WKWebView *)webView
+                 didFailProvisionalNavigation:(WKNavigation *)navigation
+                 withError:(NSError *)error
+    Purpose:  display a load failure message with the localized error and the
+              expected index.html filename.
+
+75. RXAACatalogViewController -webView:didFailNavigation:withError:
+    Signature: - (void)webView:(WKWebView *)webView
+                 didFailNavigation:(WKNavigation *)navigation
+                 withError:(NSError *)error
+    Purpose:  display a load failure message for a navigation that fails after
+              starting.
+
+76. RXAACatalogViewController -closeMenu
+    Signature: - (void)closeMenu
+    Purpose:  dismiss the entire menu from the catalog screen and restore the
+              game key window.
+
+77. RXAACatalogViewController -prefersStatusBarHidden
+    Signature: - (BOOL)prefersStatusBarHidden
+    Returns:  YES.
+
+78. RXAACatalogViewController -preferredStatusBarStyle
+    Signature: - (UIStatusBarStyle)preferredStatusBarStyle
+    Returns:  UIStatusBarStyleLightContent.
+
+D. WINDOW / INSTALL / LIFECYCLE HELPERS
+---------------------------------------
+79. RAACHEATKeyWindowForScene
+    Signature: static UIWindow *RAACHEATKeyWindowForScene(UIWindowScene *scene)
+    Purpose:  find the current key window.
+    Search order: supplied scene, all connected scenes, UIApplication.windows.
+    Returns:  nil when no key window exists.
+
+80. RAACHEATScreenBounds
+    Signature: static CGRect RAACHEATScreenBounds(void)
+    Purpose:  overlay scene bounds with a UIScreen.mainScreen fallback.
+
+81. RAACHEATScreenSafeInsets
+    Signature: static UIEdgeInsets RAACHEATScreenSafeInsets(void)
+    Purpose:  return safe-area insets from the current key/host window, skipping
+              Rxaa's own windows. Returns UIEdgeInsetsZero on older iOS.
+
+82. RAACHEATClampFloatButtonCenter
+    Signature: static CGPoint RAACHEATClampFloatButtonCenter(CGPoint center)
+    Purpose:  keep the 52x52 button fully inside the screen safe area.
+    Notes:    handles inverted min/max bounds by pinning to the screen center.
+
+83. RAACHEATSaveFloatButtonPosition
+    Signature: static void RAACHEATSaveFloatButtonPosition(void)
+    Purpose:  store the button center as normalized x/y values in
+              NSUserDefaults (rxaa.float.centerX / rxaa.float.centerY).
+
+84. RAACHEATRestoreFloatButtonPosition
+    Signature: static void RAACHEATRestoreFloatButtonPosition(void)
+    Purpose:  restore the saved normalized center, or use the top-right default,
+              then clamp to the safe area and resize the button window/view.
+
+85. RAACHEATRestoreGameKeyWindow
+    Signature: static void RAACHEATRestoreGameKeyWindow(void)
+    Purpose:  make the previous game window key again.
+    Behavior:
+      - Prefers gPreviousKeyWindow, then the current key window (excluding Rxaa
+        windows), then any visible app window.
+      - Calls makeKeyWindow on the selected game window, logs the result, and
+        clears gPreviousKeyWindow.
+
+86. RAACHEATRestorePreviousKeyWindow
+    Signature: static void RAACHEATRestorePreviousKeyWindow(void)
+    Purpose:  normal menu-close helper.
+    Behavior: hides the overlay, shows the button window at level
+              UIWindowLevelAlert + 101, restores its saved position, then calls
+              RAACHEATRestoreGameKeyWindow.
+
+87. RAACHEATDismissMenuForResignation
+    Signature: static void RAACHEATDismissMenuForResignation(void)
+    Purpose:  close an open menu when the app resigns active.
+    Behavior:
+      - Clears gMenuNav immediately.
+      - Dismisses the navigation controller without animation (via its
+        presenting controller when available).
+      - In the completion, restores the game key window (active-only) and
+        hides both Rxaa windows.
+      - If no menu was open, only hides both windows.
+    Notes:    the next UIApplicationDidBecomeActiveNotification re-shows the
+              floating button through RAACHEATEnsureOverlayVisible.
+
+88. RAACHEATRefreshOverlayBounds
+    Signature: static void RAACHEATRefreshOverlayBounds(void)
+    Purpose:  resize the overlay window, its root view and the button position
+              after a rotation/scene size change.
+
+89. RAACHEATOpenPanel
+    Signature: static void RAACHEATOpenPanel(void)
+    Purpose:  present the two-pane menu.
+    Guards:
+      - app must be UIApplicationStateActive;
+      - overlay window and root controller must exist;
+      - one menu instance at a time; another presented controller blocks open.
+    Behavior:
+      - Attaches the windows to the active scene, refreshes bounds, shows the
+        overlay, hides the button, records the previous key window, and makes
+        the overlay key/visible.
+      - Creates RXAAMenuViewController inside RXAANavigationController with
+        full-screen presentation and status-bar capture.
+      - Presents it and, if presentation did not complete, clears gMenuNav and
+        restores the game window.
+
+90. RXAAFeatureTitles
+    Signature: static NSArray<NSString *> *RXAAFeatureTitles(void)
+    Returns:  @[@"AimLock", @"ESP", @"Radar"] (legacy demo names).
+
+91. RXAAFeatureKeys
+    Signature: static NSArray<NSString *> *RXAAFeatureKeys(void)
+    Returns:  @[@"rxaa.aimlock", @"rxaa.esp", @"rxaa.radar"].
+    Notes:    written by Apply All / Reset All for compatibility with the old
+              demo menu. They do not affect a game.
+
+92. RAACHEATActiveWindowScene
+    Signature: static UIWindowScene *RAACHEATActiveWindowScene(void)
+    Purpose:  find a foreground-active UIWindowScene (iOS 13+), with a fallback
+              to any attached scene or a window's scene. Returns nil on older
+              iOS.
+
+93. RAACHEATHostWindow
+    Signature: static UIWindow *RAACHEATHostWindow(UIWindowScene *scene)
+    Purpose:  find the game's host window for the fallback opening gesture,
+              excluding Rxaa's overlay and button windows.
+
+94. RAACHEATInstallOpenGesture
+    Signature: static void RAACHEATInstallOpenGesture(
+                   RAACHEATRootController *root, UIWindowScene *scene)
+    Purpose:  install the four-finger triple-tap recognizer on the host window.
+    Behavior: reuses an existing recognizer on the same host; removes it from an
+              old host before re-adding; sets the root controller as delegate.
+
+95. RAACHEATAttachWindowToScene
+    Signature: static void RAACHEATAttachWindowToScene(void)
+    Purpose:  reattach the overlay/button windows to the active scene (iOS 13+)
+              and enforce window levels/visibility.
+    Visibility: menu open -> overlay visible, button hidden; menu closed ->
+                overlay hidden, button visible and position restored.
+
+96. RAACHEATEnsureOverlayVisible
+    Signature: static void RAACHEATEnsureOverlayVisible(void)
+    Purpose:  watchdog called by activation/scene/key/visible notifications.
+    Guards:   does nothing when the app is not active.
+    Behavior: reattaches to the scene, then shows/key the overlay while the menu
+              is open, or hides the overlay and shows the button while closed.
+
+97. RAACHEATInstallOverlay
+    Signature: static void RAACHEATInstallOverlay(void)
+    Purpose:  create the overlay window, floating button and button window.
+    Behavior:
+      - Gives up after the retry budget.
+      - Uses initWithWindowScene when available; falls back to a legacy frame
+        only if the app already has windows.
+      - Creates RAACHEATRootController and RAACHEATButtonController.
+      - Loads menu_icon.png, then menu_image.jpg, then falls back to "R".
+      - Adds tap/pan recognizers and installs the fallback open gesture.
+      - Logs the scene and bounds.
+
+98. RAACHEATTryInstall
+    Signature: static void RAACHEATTryInstall(void)
+    Purpose:  install or reattach the overlay, retrying every 1.5s while no
+              window scene is available. Resets with the activation observers.
+
+99. RAACHEATObserveLifecycle
+    Signature: static void RAACHEATObserveLifecycle(void)
+    Purpose:  register the dispatch_once notification observers.
+    Notifications:
+      - UIApplicationDidBecomeActiveNotification: reset retries, ensure the
+        overlay or install it.
+      - UIApplicationWillResignActiveNotification: close the menu and hide both
+        Rxaa windows.
+      - UISceneDidActivateNotification (iOS 13+): same as activation.
+      - UIWindowDidBecomeKeyNotification: ensure visibility unless the
+        notification came from Rxaa's own windows.
+      - UIWindowDidBecomeVisibleNotification: same as key.
+      - UIDeviceOrientationDidChangeNotification: refresh bounds, then refresh
+        again after 0.25s.
+    Notes:    does not inspect or modify game data.
+
+100. %ctor (Logos constructor)
+    Signature: %ctor { ... }
+    Purpose:  install lifecycle observers and schedule the first install after
+              1.5 seconds on the main queue.
 
 
 PART 2 - INDEX.HTML JAVASCRIPT FUNCTIONS

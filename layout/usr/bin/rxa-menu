@@ -1,6 +1,6 @@
 #!/bin/sh
 # Launcher for Rxa Mod Menu & Config Generator (Python Engine)
-# Bundled in com.rxaa.menudebug (v1.2.5)
+# Bundled in com.rxaa.menudebug (v1.3.1)
 
 SCRIPT_PATH="/Library/Application Support/RAACHEATMenuDebug/mod_menu.py"
 if [ ! -f "$SCRIPT_PATH" ]; then
